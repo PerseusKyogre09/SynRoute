@@ -3,7 +3,9 @@
 SynRoute reads `synroute-models.json` from the current directory. Set
 `SYNROUTE_MODELS_CONFIG` to use another path. If the file is absent, the
 registry checks the standard local LM Studio (`http://127.0.0.1:1234/v1`)
-and llama.cpp server (`http://127.0.0.1:8080/v1`) endpoints.
+and llama.cpp server (`http://127.0.0.1:8080/v1`) endpoints, and includes the
+Cerebras remote endpoint (`https://api.cerebras.ai/v1`). Cerebras discovery is
+blocked unless remote consent is explicitly enabled.
 
 Example configuration (no API keys are stored in this file):
 
@@ -19,7 +21,7 @@ Example configuration (no API keys are stored in this file):
       "api_key_env": null,
       "model_ids": [],
       "metadata": {},
-      "request_timeout_seconds": 15,
+      "request_timeout_seconds": 60,
       "enabled": true
     },
     {
@@ -51,7 +53,11 @@ The secret value itself is read only from the named environment variable and
 is never included in registry output or error text.
 
 Environment overrides: `SYNROUTE_MODELS_LM_STUDIO_URL`,
-`SYNROUTE_MODELS_LLAMA_CPP_URL`, and `SYNROUTE_MODELS_REQUEST_TIMEOUT_SECONDS`.
+`SYNROUTE_MODELS_LLAMA_CPP_URL`, `SYNROUTE_MODELS_CEREBRAS_URL`, and
+`SYNROUTE_MODELS_REQUEST_TIMEOUT_SECONDS`.
+The built-in local providers default to a 60-second request timeout. Set
+`request_timeout_seconds` per provider or use the timeout environment override
+to change it; accepted values are 1 through 300 seconds.
 The config path is selected by `SYNROUTE_MODELS_CONFIG`.
 
 Run `synroute models`, `synroute models --refresh`, or add `--json` for the

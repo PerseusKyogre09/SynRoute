@@ -1,12 +1,17 @@
 //! Small, explicit local demonstration workflow. This is not an agent coordinator.
 use crate::{
+    agent::{AgentStrategy, CodexAppServer},
+    benchmark,
     core::{ExecutionState, VerificationCommand},
+    inference::{self, InferenceResponse},
+    models::RegistryConfig,
     repository::{self, RepositoryProfile},
     sandbox::{
         ResourceLimits, SandboxConfig,
         authorization::{CommandRule, ExecutionPolicy},
         docker::DockerSandbox,
     },
+    selector::SelectionReport,
     storage::{
         ExecutionEventType, ExecutionIntent, ExecutionRepository, FailureClassification,
         PersistedExecutionConfig, SqliteStorage, WorkspaceRepository,
@@ -30,6 +35,127 @@ pub struct DemoResult {
     pub verification: Option<VerificationReport>,
     pub cleanup: String,
     pub state: ExecutionState,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TaskDemoReport {
+    pub repository: TaskDemoRepository,
+    pub selection: SelectionReport,
+    pub inference_response: Option<InferenceResponse>,
+    pub inference_error: Option<String>,
+    pub inference_notice: &'static str,
+    pub execution_status: String,
+    pub execution_summary: Option<crate::execution::coordinator::ExecutionSummary>,
+    pub execution_error: Option<String>,
+    pub verification_status: String,
+    pub verification_evidence: Vec<crate::storage::VerificationRecord>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TaskDemoRepository {
+    pub name: String,
+    pub root: std::path::PathBuf,
+    pub revision: String,
+    pub fingerprint: String,
+    pub project_type: String,
+    pub languages: Vec<String>,
+}
+
+/// Unified repository analysis, model selection, metadata-only inference, and fail-closed
+/// coding-agent orchestration demonstration. Repository source files are never sent.
+pub async fn run_task(
+    repository: &Path,
+    task: &str,
+    timeout: Duration,
+    config: &RegistryConfig,
+    storage: SqliteStorage,
+) -> Result<TaskDemoReport> {
+    anyhow::ensure!(!task.trim().is_empty(), "--task must not be empty");
+    let profile = crate::repository::profiler::profile(
+        repository,
+        &crate::repository::profiler::ProfileOptions {
+            provider: None,
+            model: None,
+            allow_remote: false,
+        },
+    )
+    .await?;
+    let fingerprint = benchmark::repository_fingerprint(&profile)?;
+    let repository_info = TaskDemoRepository {
+        name: profile.repository.name.clone(),
+        root: profile.repository.root.clone(),
+        revision: profile.repository.revision.clone(),
+        fingerprint,
+        project_type: profile.project.project_type.clone(),
+        languages: profile.languages.iter().map(|l| l.name.clone()).collect(),
+    };
+    let ask = inference::ask_with_profile(&profile, task, config, &storage).await?;
+    let selection = ask.selection;
+    let mut execution_status = "not_started_no_available_model".to_owned();
+    let mut execution_summary = None;
+    let mut execution_error = None;
+    let mut verification_status = "not_run".to_owned();
+    let mut verification_evidence = Vec::new();
+
+    if let Some(selected) = selection.selected.as_ref() {
+        let strategy = AgentStrategy {
+            task_category: format!("{:?}", selection.task_category).to_ascii_lowercase(),
+            selection_mode: inference::selection_mode_name(selection.mode).to_owned(),
+            provider_id: selected.provider_id.clone(),
+            model_id: selected.model_id.clone(),
+            repository_fingerprint: repository_info.fingerprint.clone(),
+            repository_name: repository_info.name.clone(),
+            repository_revision: repository_info.revision.clone(),
+            project_type: repository_info.project_type.clone(),
+            selection_explanation: selection.explanation.clone(),
+        };
+        match crate::execution::coordinator::run_with_strategy(
+            storage.clone(),
+            repository,
+            task,
+            timeout,
+            &CodexAppServer,
+            Some(strategy),
+        )
+        .await
+        {
+            Ok(summary) => {
+                execution_status = format!("{:?}", summary.state).to_ascii_lowercase();
+                match storage.executions().report(summary.execution_id).await {
+                    Ok(report) => {
+                        verification_evidence = report.verifications;
+                        if !verification_evidence.is_empty() {
+                            verification_status = verification_evidence
+                                .last()
+                                .map(|v| format!("{:?}", v.report.status).to_ascii_lowercase())
+                                .unwrap_or_else(|| "not_run".into());
+                        }
+                    }
+                    Err(error) => verification_status = format!("evidence_unavailable: {error}"),
+                }
+                execution_error = summary.primary_error.clone();
+                execution_summary = Some(summary);
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                execution_status = "not_started_or_unsupported".into();
+                execution_error = Some(message);
+            }
+        }
+    }
+
+    Ok(TaskDemoReport {
+        repository: repository_info,
+        selection,
+        inference_response: ask.inference,
+        inference_error: ask.inference_error,
+        inference_notice: "Inference is an answer based on repository profile metadata; it does not modify code or constitute verification.",
+        execution_status,
+        execution_summary,
+        execution_error,
+        verification_status,
+        verification_evidence,
+    })
 }
 
 /// Runs the fixed, persisted pytest contract in a Docker sandbox. The only executable

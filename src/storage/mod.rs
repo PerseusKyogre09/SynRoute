@@ -13,10 +13,12 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod benchmarks;
 mod containers;
 mod executions;
 mod recovery;
 mod workspaces;
+pub use benchmarks::*;
 pub use containers::*;
 pub use executions::*;
 pub use recovery::*;
@@ -161,6 +163,9 @@ impl SqliteStorage {
     }
     pub fn containers(&self) -> SqliteContainerDiagnosticRepository {
         SqliteContainerDiagnosticRepository::new(self.pool.clone())
+    }
+    pub fn benchmarks(&self) -> SqliteBenchmarkRepository {
+        SqliteBenchmarkRepository::new(self.pool.clone())
     }
 }
 
@@ -466,7 +471,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap(),
-            7
+            8
         );
     }
 

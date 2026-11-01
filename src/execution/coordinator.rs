@@ -1,5 +1,5 @@
 use crate::{
-    agent::{AgentRequest, CodingAgent},
+    agent::{AgentRequest, AgentStrategy, CodingAgent},
     core::{ExecutionState, VerificationCommand},
     repository,
     storage::{
@@ -35,6 +35,19 @@ pub async fn run(
     timeout: Duration,
     agent: &dyn CodingAgent,
 ) -> Result<ExecutionSummary> {
+    run_with_strategy(storage, repository_path, task, timeout, agent, None).await
+}
+
+/// Coordinator entry point carrying the repository profile and selector decision through
+/// the durable execution intent and into a supported isolated agent adapter.
+pub async fn run_with_strategy(
+    storage: SqliteStorage,
+    repository_path: &Path,
+    task: &str,
+    timeout: Duration,
+    agent: &dyn CodingAgent,
+    strategy: Option<AgentStrategy>,
+) -> Result<ExecutionSummary> {
     anyhow::ensure!(!task.trim().is_empty(), "task description cannot be empty");
     anyhow::ensure!(!timeout.is_zero(), "execution timeout must be positive");
     anyhow::ensure!(
@@ -55,7 +68,7 @@ pub async fn run(
         .create_execution(ExecutionIntent {
             id,
             description: task.to_owned(),
-            metadata: json!({"agent": agent.id(), "coordinator": "phase4"}),
+            metadata: json!({"agent": agent.id(), "coordinator": "phase4", "strategy": strategy.clone()}),
             repository_identity: repository_identity.clone(),
             repository_root: profile.root.clone(),
             repository_revision: profile.revision.clone(),
@@ -133,6 +146,7 @@ pub async fn run(
                     prompt: task.to_owned(),
                     workspace: path.clone(),
                     timeout,
+                    strategy,
                 },
                 event_tx,
                 cancel_rx,

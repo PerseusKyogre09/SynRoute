@@ -57,8 +57,17 @@ enum Command {
     },
     /// Inspect repository identity and available verification hints.
     Inspect { repository: PathBuf },
-    /// Run the fixed, explicitly authorized pytest contract in a Docker sandbox.
-    Demo { repository: PathBuf },
+    /// Show repository analysis, model selection/inference, and isolated execution status.
+    Demo {
+        repository: PathBuf,
+        /// Add a task to demonstrate selection and inference before coding-agent orchestration.
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// List persisted executions, newest first.
     History {
         #[arg(long, short, default_value_t = 20)]
@@ -84,6 +93,34 @@ enum Command {
         /// Query providers now (otherwise configured IDs are listed without a request).
         #[arg(long)]
         refresh: bool,
+    },
+    /// Benchmark available configured models against a compact repository profile.
+    Benchmark {
+        repository: PathBuf,
+        #[arg(long, default_value_t = 3)]
+        rounds: u8,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+    /// Select a currently available model using repository-specific benchmark evidence.
+    Select {
+        repository: PathBuf,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask an available model using repository profile metadata, without running a coding agent.
+    Ask {
+        repository: PathBuf,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -274,9 +311,31 @@ async fn main() -> Result<()> {
             let profile = synroute::repository::discover(&repository).await?;
             println!("{}", serde_json::to_string_pretty(&profile)?);
         }
-        Command::Demo { repository } => {
-            let result = synroute::demo::run(&repository, storage).await?;
-            print_demo(result);
+        Command::Demo {
+            repository,
+            task,
+            timeout,
+            json,
+        } => {
+            if let Some(task) = task {
+                let config = synroute::models::RegistryConfig::load().await?;
+                let report = synroute::demo::run_task(
+                    &repository,
+                    &task,
+                    std::time::Duration::from_secs(timeout),
+                    &config,
+                    storage,
+                )
+                .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_task_demo(report);
+                }
+            } else {
+                let result = synroute::demo::run(&repository, storage).await?;
+                print_demo(result);
+            }
         }
         Command::History { limit, json } => {
             let rows = storage.executions().list_executions(Some(limit)).await?;
@@ -304,6 +363,182 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
                 print_stats(stats);
+            }
+        }
+        Command::Benchmark {
+            repository,
+            rounds,
+            model,
+            json,
+            timeout,
+        } => {
+            let config = synroute::models::RegistryConfig::load().await?;
+            let report = synroute::benchmark::run(
+                &repository,
+                &config,
+                &storage,
+                model.as_deref(),
+                rounds,
+                std::time::Duration::from_secs(timeout),
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Benchmark run {} for {} ({})",
+                    report.run.run_id, report.run.repository_root, report.run.repository_revision
+                );
+                println!("Scoring: {}", report.scoring_notice);
+                for round in &report.rounds {
+                    println!(
+                        "{} / {} round {}: {} latency={}ms total_tokens={} relevance={:?} context={:?} technical={:?} concise={:?}",
+                        round.provider_id,
+                        round.model_id.as_deref().unwrap_or("unavailable"),
+                        round.round_number,
+                        round.status,
+                        round
+                            .latency_ms
+                            .map_or_else(|| "n/a".into(), |v| v.to_string()),
+                        round
+                            .total_tokens
+                            .map_or_else(|| "n/a".into(), |v| v.to_string()),
+                        round.task_relevance,
+                        round.repository_context,
+                        round.technical_correctness,
+                        round.conciseness
+                    );
+                    if let Some(detail) = &round.failure_detail {
+                        println!("  Failure: {detail}");
+                    }
+                    if let Some(response) = &round.response_text {
+                        println!("  Response: {response}");
+                    }
+                }
+                println!("Aggregate scores");
+                for aggregate in &report.aggregates {
+                    println!(
+                        "{} / {}: rounds={}/{} relevance={:?} context={:?} technical={:?} concise={:?} latency={:?}ms tokens={:?}",
+                        aggregate.provider_id,
+                        aggregate.model_id,
+                        aggregate.successful_rounds,
+                        aggregate.successful_rounds + aggregate.failed_rounds,
+                        aggregate.task_relevance,
+                        aggregate.repository_context,
+                        aggregate.technical_correctness,
+                        aggregate.conciseness,
+                        aggregate.average_latency_ms,
+                        aggregate.average_total_tokens
+                    );
+                }
+                if report.rounds.is_empty() {
+                    println!(
+                        "No available models were benchmarked; the run was persisted with no invented results."
+                    );
+                }
+            }
+        }
+        Command::Select {
+            repository,
+            task,
+            json,
+        } => {
+            let config = synroute::models::RegistryConfig::load().await?;
+            let report = synroute::selector::select(&repository, &task, &config, &storage).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Task category: {:?}\nSelection mode: {:?}",
+                    report.task_category, report.mode
+                );
+                if let Some(selected) = &report.selected {
+                    println!(
+                        "Selected: {} / {} ({})",
+                        selected.provider_id, selected.model_id, selected.display_name
+                    );
+                    if let Some(evidence) = &selected.benchmark_evidence {
+                        println!(
+                            "Evidence: {} successful stored round(s); derived rank score={:.3}; relevance={:?}, context={:?}, technical={:?}, conciseness={:?}, average latency={:?} ms",
+                            evidence.successful_rounds,
+                            selected.evidence_rank_score.unwrap(),
+                            evidence.task_relevance,
+                            evidence.repository_context,
+                            evidence.technical_correctness,
+                            evidence.conciseness,
+                            evidence.average_latency_ms
+                        );
+                    } else {
+                        println!(
+                            "Fallback metadata: capability match={:?}, context window={:?}; no benchmark score is available.",
+                            selected.capability_match, selected.context_window
+                        );
+                    }
+                } else {
+                    println!("No model selected.");
+                }
+                println!("{}", report.explanation);
+                if !report.unavailable_providers.is_empty() {
+                    println!("Unavailable providers:");
+                    for provider in &report.unavailable_providers {
+                        println!(
+                            "  {}: {}",
+                            provider.provider_id,
+                            provider.error.as_deref().unwrap_or("unavailable")
+                        );
+                    }
+                }
+                if !report.available_models_without_evidence.is_empty() {
+                    println!("Available models without benchmark evidence:");
+                    for model in &report.available_models_without_evidence {
+                        println!("  {} / {}", model.provider_id, model.model_id);
+                    }
+                }
+                println!("Ranked models:");
+                for model in &report.ranked_models {
+                    println!(
+                        "  {}. {} / {} — basis: {}",
+                        model.rank, model.provider_id, model.model_id, model.ranking_basis
+                    );
+                }
+            }
+        }
+        Command::Ask {
+            repository,
+            task,
+            json,
+        } => {
+            let config = synroute::models::RegistryConfig::load().await?;
+            let report = synroute::inference::ask(&repository, &task, &config, &storage).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Selection mode: {}",
+                    synroute::inference::selection_mode_name(report.selection.mode)
+                );
+                println!("Task category: {:?}", report.selection.task_category);
+                if let Some(selected) = &report.selection.selected {
+                    println!(
+                        "Provider/model: {} / {}",
+                        selected.provider_id, selected.model_id
+                    );
+                    println!("{}", report.selection.explanation);
+                } else {
+                    println!("{}", report.selection.explanation);
+                }
+                if let Some(response) = report.inference {
+                    println!("\nResponse:\n{}", response.response_text);
+                    println!(
+                        "\nLatency: {} ms; token usage: prompt={:?}, completion={:?}, total={:?}",
+                        response.latency_ms,
+                        response.token_usage.prompt,
+                        response.token_usage.completion,
+                        response.token_usage.total
+                    );
+                } else if let Some(error) = report.inference_error {
+                    println!("Inference failed: {error}");
+                }
             }
         }
         Command::Models { .. } => {
@@ -502,6 +737,101 @@ fn print_stats(stats: synroute::observability::Stats) {
             group.timed_out,
             group.recovery_required
         );
+    }
+}
+
+fn print_task_demo(report: synroute::demo::TaskDemoReport) {
+    println!("SynRoute task demo");
+    println!("\n1. Repository analysis");
+    println!(
+        "{} — {} at {} (fingerprint {})",
+        report.repository.name,
+        report.repository.project_type,
+        report.repository.revision,
+        report.repository.fingerprint
+    );
+    println!("Languages: {}", report.repository.languages.join(", "));
+
+    println!("\n2. Model discovery and task classification");
+    println!("Task category: {:?}", report.selection.task_category);
+    println!("Selection mode: {:?}", report.selection.mode);
+    for model in &report.selection.ranked_models {
+        println!("Available: {} / {}", model.provider_id, model.model_id);
+    }
+    for provider in &report.selection.unavailable_providers {
+        println!(
+            "Unavailable provider: {} ({})",
+            provider.provider_id,
+            provider.error.as_deref().unwrap_or("unavailable")
+        );
+    }
+    if let Some(selected) = &report.selection.selected {
+        println!(
+            "Recommendation: {} / {} ({})",
+            selected.provider_id, selected.model_id, selected.display_name
+        );
+        match &selected.benchmark_evidence {
+            Some(evidence) => println!(
+                "Stored benchmark evidence: {} successful round(s); relevance={:?}, context={:?}, technical={:?}, conciseness={:?}, latency={:?} ms",
+                evidence.successful_rounds,
+                evidence.task_relevance,
+                evidence.repository_context,
+                evidence.technical_correctness,
+                evidence.conciseness,
+                evidence.average_latency_ms
+            ),
+            None => println!(
+                "Benchmark evidence: none; recommendation uses labelled metadata fallback."
+            ),
+        }
+        println!("Selection explanation: {}", report.selection.explanation);
+    } else {
+        println!("No available model was selected.");
+        println!("{}", report.selection.explanation);
+    }
+
+    println!("\n3. Inference");
+    if let Some(response) = &report.inference_response {
+        println!(
+            "Actual response from {} / {}:",
+            response.provider_id, response.model_id
+        );
+        println!("{}", response.response_text);
+        println!(
+            "Latency: {} ms; token usage: {:?}",
+            response.latency_ms, response.token_usage
+        );
+    } else if let Some(error) = &report.inference_error {
+        println!("No response received: {error}");
+    } else {
+        println!("No inference was run because no model was available.");
+    }
+    println!("{}", report.inference_notice);
+
+    println!("\n4. Coding-agent execution");
+    println!("Status: {}", report.execution_status);
+    if let Some(summary) = &report.execution_summary {
+        println!(
+            "Execution ID: {}; lifecycle state: {:?}",
+            summary.execution_id, summary.state
+        );
+    }
+    if let Some(error) = &report.execution_error {
+        println!("Execution detail: {error}");
+    }
+
+    println!("\n5. Independent verification");
+    println!("Status: {}", report.verification_status);
+    if report.verification_evidence.is_empty() {
+        println!("No persisted verification evidence is available.");
+    } else {
+        for record in &report.verification_evidence {
+            println!(
+                "{:?}: {} check(s)",
+                record.report.status,
+                record.report.checks.len()
+            );
+        }
     }
 }
 

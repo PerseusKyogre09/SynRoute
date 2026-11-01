@@ -23,6 +23,14 @@ pub struct RegistryConfig {
 }
 impl Default for RegistryConfig {
     fn default() -> Self {
+        let mut cerebras = ProviderConfig::builtin(
+            "cerebras",
+            ProviderKind::OpenAiCompatible,
+            "https://api.cerebras.ai/v1",
+            false,
+        );
+        cerebras.name = "Cerebras".into();
+        cerebras.api_key_env = Some("CEREBRAS_API_KEY".into());
         Self {
             providers: vec![
                 ProviderConfig::builtin(
@@ -37,6 +45,7 @@ impl Default for RegistryConfig {
                     "http://127.0.0.1:8080/v1",
                     true,
                 ),
+                cerebras,
             ],
         }
     }
@@ -67,7 +76,7 @@ impl Default for ProviderConfig {
             api_key_env: None,
             model_ids: vec![],
             metadata: BTreeMap::new(),
-            request_timeout_seconds: 15,
+            request_timeout_seconds: 60,
             enabled: true,
         }
     }
@@ -168,6 +177,9 @@ impl RegistryConfig {
         if let Ok(value) = env::var("SYNROUTE_MODELS_LLAMA_CPP_URL") {
             self.provider_mut("llama-cpp").base_url = value;
         }
+        if let Ok(value) = env::var("SYNROUTE_MODELS_CEREBRAS_URL") {
+            self.provider_mut("cerebras").base_url = value;
+        }
         if let Ok(value) = env::var("SYNROUTE_MODELS_REQUEST_TIMEOUT_SECONDS") {
             let timeout = value.parse().map_err(|_| {
                 RegistryError::Config("invalid SYNROUTE_MODELS_REQUEST_TIMEOUT_SECONDS".into())
@@ -182,13 +194,33 @@ impl RegistryConfig {
         if let Some(i) = self.providers.iter().position(|p| p.id == id) {
             return &mut self.providers[i];
         }
-        let (kind, url) = if id == "lm-studio" {
-            (ProviderKind::LmStudio, "http://127.0.0.1:1234/v1")
-        } else {
-            (ProviderKind::LlamaCpp, "http://127.0.0.1:8080/v1")
+        let provider = match id {
+            "lm-studio" => ProviderConfig::builtin(
+                id,
+                ProviderKind::LmStudio,
+                "http://127.0.0.1:1234/v1",
+                true,
+            ),
+            "llama-cpp" => ProviderConfig::builtin(
+                id,
+                ProviderKind::LlamaCpp,
+                "http://127.0.0.1:8080/v1",
+                true,
+            ),
+            "cerebras" => {
+                let mut provider = ProviderConfig::builtin(
+                    id,
+                    ProviderKind::OpenAiCompatible,
+                    "https://api.cerebras.ai/v1",
+                    false,
+                );
+                provider.name = "Cerebras".into();
+                provider.api_key_env = Some("CEREBRAS_API_KEY".into());
+                provider
+            }
+            _ => ProviderConfig::default(),
         };
-        self.providers
-            .push(ProviderConfig::builtin(id, kind, url, true));
+        self.providers.push(provider);
         self.providers.last_mut().unwrap()
     }
     fn validate(&self) -> Result<(), RegistryError> {
@@ -269,6 +301,7 @@ async fn discover_provider(
         let endpoint = format!("{}/models", p.base_url.trim_end_matches('/'));
         let client = Client::builder()
             .timeout(Duration::from_secs(p.request_timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| RegistryError::Config("could not initialize HTTP client".into()))?;
         let mut request = client.get(endpoint);
@@ -405,6 +438,20 @@ mod tests {
         .unwrap();
         assert_eq!(config.providers[0].id, "x");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn local_provider_defaults_to_sixty_second_request_timeout() {
+        let config = RegistryConfig::default();
+        for id in ["lm-studio", "llama-cpp"] {
+            let provider = config
+                .providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .unwrap();
+            assert!(provider.local);
+            assert_eq!(provider.request_timeout_seconds, 60);
+        }
     }
 
     #[test]

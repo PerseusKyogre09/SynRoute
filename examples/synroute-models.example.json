@@ -1,0 +1,40 @@
+{
+  "providers": [
+    {
+      "id": "lm-studio",
+      "name": "LM Studio",
+      "kind": "lm_studio",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "local": true,
+      "api_key_env": null,
+      "model_ids": [],
+      "metadata": {},
+      "request_timeout_seconds": 60,
+      "enabled": true
+    },
+    {
+      "id": "llama-cpp",
+      "name": "llama.cpp server",
+      "kind": "llama_cpp",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "local": true,
+      "api_key_env": null,
+      "model_ids": [],
+      "metadata": {},
+      "request_timeout_seconds": 60,
+      "enabled": true
+    },
+    {
+      "id": "cerebras",
+      "name": "Cerebras",
+      "kind": "open_ai_compatible",
+      "base_url": "https://api.cerebras.ai/v1",
+      "local": false,
+      "api_key_env": "CEREBRAS_API_KEY",
+      "model_ids": [],
+      "metadata": {},
+      "request_timeout_seconds": 30,
+      "enabled": true
+    }
+  ]
+}

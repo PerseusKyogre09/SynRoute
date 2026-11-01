@@ -1,14 +1,18 @@
 pub mod agent;
+pub mod benchmark;
 pub mod core;
 pub mod demo;
 pub mod execution;
 mod git;
+pub mod inference;
 pub mod memory;
 pub mod models;
 pub mod observability;
+pub mod openai;
 pub mod recovery;
 pub mod repository;
 pub mod sandbox;
+pub mod selector;
 pub mod storage;
 pub mod verification;
 pub mod workspace;

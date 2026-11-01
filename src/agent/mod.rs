@@ -27,6 +27,21 @@ pub struct AgentRequest {
     pub prompt: String,
     pub workspace: PathBuf,
     pub timeout: Duration,
+    /// Repository/task strategy chosen before entering the isolated coding-agent boundary.
+    pub strategy: Option<AgentStrategy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStrategy {
+    pub task_category: String,
+    pub selection_mode: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub repository_fingerprint: String,
+    pub repository_name: String,
+    pub repository_revision: String,
+    pub project_type: String,
+    pub selection_explanation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +123,7 @@ mod tests {
                     prompt: "task".into(),
                     workspace: PathBuf::from("/tmp/work"),
                     timeout: Duration::from_secs(1),
+                    strategy: None,
                 },
                 _tx,
                 cancel,
