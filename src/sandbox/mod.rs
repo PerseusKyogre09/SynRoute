@@ -83,6 +83,11 @@ pub enum SandboxError {
     Provider(String),
     #[error("sandbox ownership could not be verified; refusing cleanup: {0}")]
     Ownership(String),
+    #[error("Docker container creation failed: {primary}; cleanup result: {cleanup:?}")]
+    Creation {
+        primary: String,
+        cleanup: Option<String>,
+    },
 }
 
 #[async_trait]

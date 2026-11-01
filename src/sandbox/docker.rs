@@ -57,6 +57,11 @@ struct DockerSession {
     containers: Vec<String>,
 }
 
+/// Constructed only after `docker create` returns success and a valid container ID.
+struct CreatedContainer {
+    id: String,
+}
+
 #[async_trait]
 impl SandboxSession for DockerSession {
     async fn execute(
@@ -68,7 +73,8 @@ impl SandboxSession for DockerSession {
         limits.validate()?;
         validate_command(&command)?;
         let started = Instant::now();
-        let id = self.create_container(&command, &limits).await?;
+        let created = self.create_container(&command, &limits).await?;
+        let id = created.id;
         self.containers.push(id.clone());
         let output = match run_bounded(
             &self.docker,
@@ -83,7 +89,7 @@ impl SandboxSession for DockerSession {
             Ok(out) => out,
             Err(error) => {
                 return match self.remove_owned(&id, true).await {
-                    Ok(()) => Err(error),
+                    Ok(()) => Err(SandboxError::Provider(error.to_string())),
                     Err(cleanup) => Err(SandboxError::Ownership(format!(
                         "{error}; cleanup failed: {cleanup}"
                     ))),
@@ -119,16 +125,11 @@ impl DockerSession {
         &self,
         command: &SandboxCommand,
         limits: &ResourceLimits,
-    ) -> Result<String, SandboxError> {
+    ) -> Result<CreatedContainer, SandboxError> {
         let workspace = self
             .workspace
             .to_str()
             .ok_or_else(|| SandboxError::InvalidConfig("workspace path is not UTF-8".into()))?;
-        if workspace.contains(',') {
-            return Err(SandboxError::InvalidConfig(
-                "Docker mount paths containing commas are unsupported".into(),
-            ));
-        }
         let name = format!("synroute-{}-{}", self.config.execution_id, Uuid::new_v4());
         let mut args = vec![
             "create".to_owned(),
@@ -143,8 +144,8 @@ impl DockerSession {
             format!("--memory={}", limits.memory_bytes),
             format!("--cpus={}", limits.cpu_count),
             format!("--pids-limit={}", limits.pids),
-            format!("--mount=type=bind,src={workspace},dst=/workspace,rw"),
-            "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=67108864".into(),
+            workspace_mount_arg(workspace)?,
+            tmpfs_mount_arg(),
             "--workdir=/workspace".into(),
             format!("--label={MANAGED}=true"),
             format!("--label={EXECUTION}={}", self.config.execution_id),
@@ -156,42 +157,100 @@ impl DockerSession {
         args.push(self.config.image.clone());
         args.push(command.executable.clone());
         args.extend(command.args.clone());
-        let output = match run_capture(
+        let output = match run_bounded(
             &self.docker,
             &args,
             limits.timeout.min(Duration::from_secs(30)),
+            64 * 1024,
+            64 * 1024,
+            watch::channel(false).1,
         )
         .await
         {
-            Ok(output) => output,
-            Err(error) => {
-                return match self.remove_owned(&name, true).await {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(SandboxError::Ownership(format!(
-                        "docker create failed ({error}); possible container cleanup failed ({cleanup})"
-                    ))),
-                };
+            Err(DockerCliError::NotStarted(error)) => {
+                return Err(SandboxError::Creation {
+                    primary: error,
+                    cleanup: None,
+                });
             }
+            Err(DockerCliError::Operation(error)) => {
+                return Err(self.creation_error(error, &name, true).await);
+            }
+            Ok(output) => output,
         };
-        if output.termination != Termination::Exited || output.exit_code != Some(0) {
-            let error = SandboxError::Provider(format!(
-                "docker create failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-            return match self.remove_owned(&name, true).await {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(SandboxError::Ownership(format!(
-                    "{error}; possible container cleanup failed ({cleanup})"
-                ))),
-            };
+        if output.termination == Termination::Exited && output.exit_code == Some(0) {
+            let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if valid_id(&id) {
+                return Ok(CreatedContainer { id });
+            }
+            return Err(self
+                .creation_error(
+                    "docker create returned an invalid container ID".into(),
+                    &name,
+                    true,
+                )
+                .await);
         }
-        let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !valid_id(&id) {
-            return Err(SandboxError::Provider(
-                "docker create returned invalid container ID".into(),
+        let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let primary = if diagnostic.is_empty() {
+            format!(
+                "docker create ended with {:?} (exit code {:?})",
+                output.termination, output.exit_code
+            )
+        } else {
+            diagnostic.clone()
+        };
+        let ambiguous = output.termination != Termination::Exited
+            || output.exit_code.is_none()
+            || ambiguous_creation_failure(&diagnostic);
+        Err(self.creation_error(primary, &name, ambiguous).await)
+    }
+
+    async fn creation_error(
+        &self,
+        primary: String,
+        generated_name: &str,
+        inspect_possible_container: bool,
+    ) -> SandboxError {
+        let cleanup = if inspect_possible_container {
+            self.cleanup_ambiguous_creation(generated_name)
+                .await
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
+        SandboxError::Creation { primary, cleanup }
+    }
+
+    async fn cleanup_ambiguous_creation(&self, generated_name: &str) -> Result<(), SandboxError> {
+        if !valid_container_reference(generated_name, self.config.execution_id) {
+            return Err(SandboxError::Ownership(
+                "generated container name failed validation".into(),
             ));
         }
-        Ok(id)
+        let args = vec![
+            "ps".into(),
+            "--all".into(),
+            "--filter".into(),
+            format!("name={generated_name}"),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ];
+        let listing = run_capture(&self.docker, &args, Duration::from_secs(10)).await?;
+        if listing.exit_code != Some(0) {
+            return Err(SandboxError::Provider(format!(
+                "could not inspect ambiguous container creation: {}",
+                String::from_utf8_lossy(&listing.stderr).trim()
+            )));
+        }
+        let exists = String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .any(|name| name == generated_name);
+        if !exists {
+            return Ok(());
+        }
+        self.remove_owned(generated_name, true).await
     }
 
     async fn remove_owned(&self, reference: &str, force: bool) -> Result<(), SandboxError> {
@@ -239,6 +298,33 @@ impl DockerSession {
 
 fn valid_id(value: &str) -> bool {
     (12..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn workspace_mount_arg(workspace: &str) -> Result<String, SandboxError> {
+    if workspace.contains(',') || workspace.chars().any(char::is_control) {
+        return Err(SandboxError::InvalidConfig(
+            "workspace path contains characters unsupported by Docker --mount syntax".into(),
+        ));
+    }
+    // Bind mounts are read-write by default; Docker --mount accepts key=value options only.
+    Ok(format!("--mount=type=bind,src={workspace},dst=/workspace"))
+}
+fn tmpfs_mount_arg() -> String {
+    // Docker's --tmpfs uses path:options syntax, where rw is valid.
+    "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=67108864".into()
+}
+fn ambiguous_creation_failure(diagnostic: &str) -> bool {
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    [
+        "connection reset",
+        "unexpected eof",
+        "broken pipe",
+        "context deadline exceeded",
+        "client.timeout",
+        "client timeout",
+        "error during connect",
+    ]
+    .iter()
+    .any(|marker| diagnostic.contains(marker))
 }
 fn valid_container_reference(value: &str, execution_id: Uuid) -> bool {
     if valid_id(value) {
@@ -296,6 +382,18 @@ struct BoundedOutput {
     stderr_truncated: bool,
     termination: Termination,
 }
+#[derive(Debug)]
+enum DockerCliError {
+    NotStarted(String),
+    Operation(String),
+}
+impl std::fmt::Display for DockerCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted(error) | Self::Operation(error) => f.write_str(error),
+        }
+    }
+}
 async fn run_capture(
     docker: &Path,
     args: &[String],
@@ -310,6 +408,7 @@ async fn run_capture(
         watch::channel(false).1,
     )
     .await
+    .map_err(|error| SandboxError::Provider(error.to_string()))
 }
 async fn run_bounded(
     docker: &Path,
@@ -318,7 +417,7 @@ async fn run_bounded(
     out_max: usize,
     err_max: usize,
     mut cancellation: watch::Receiver<bool>,
-) -> Result<BoundedOutput, SandboxError> {
+) -> Result<BoundedOutput, DockerCliError> {
     let mut child = Command::new(docker)
         .args(args)
         .stdin(Stdio::null())
@@ -326,7 +425,7 @@ async fn run_bounded(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| SandboxError::Provider(format!("start Docker CLI: {e}")))?;
+        .map_err(|e| DockerCliError::NotStarted(format!("start Docker CLI: {e}")))?;
     let stdout = tokio::spawn(read_bounded(child.stdout.take().unwrap(), out_max));
     let stderr = tokio::spawn(read_bounded(child.stderr.take().unwrap(), err_max));
     let mut cancellation_open = true;
@@ -337,7 +436,7 @@ async fn run_bounded(
             tokio::select! {
                 result = &mut wait => break match result {
                     Ok(Ok(status)) => (Termination::Exited, Some(status)),
-                    Ok(Err(error)) => return Err(SandboxError::Provider(format!("wait for Docker CLI: {error}"))),
+                    Ok(Err(error)) => return Err(DockerCliError::Operation(format!("wait for Docker CLI: {error}"))),
                     Err(_) => (Termination::TimedOut, None),
                 },
                 changed = cancellation.changed(), if cancellation_open => match changed {
@@ -354,12 +453,12 @@ async fn run_bounded(
     }
     let (stdout, stdout_truncated) = stdout
         .await
-        .map_err(|e| SandboxError::Provider(e.to_string()))?
-        .map_err(|e| SandboxError::Provider(format!("read Docker stdout: {e}")))?;
+        .map_err(|e| DockerCliError::Operation(e.to_string()))?
+        .map_err(|e| DockerCliError::Operation(format!("read Docker stdout: {e}")))?;
     let (stderr, stderr_truncated) = stderr
         .await
-        .map_err(|e| SandboxError::Provider(e.to_string()))?
-        .map_err(|e| SandboxError::Provider(format!("read Docker stderr: {e}")))?;
+        .map_err(|e| DockerCliError::Operation(e.to_string()))?
+        .map_err(|e| DockerCliError::Operation(format!("read Docker stderr: {e}")))?;
     Ok(BoundedOutput {
         exit_code: status.and_then(|s| s.code()),
         stdout,
@@ -425,6 +524,29 @@ mod tests {
                 args: vec![]
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_and_tmpfs_mounts_use_their_documented_syntax() {
+        assert_eq!(
+            workspace_mount_arg("/tmp/work space").unwrap(),
+            "--mount=type=bind,src=/tmp/work space,dst=/workspace"
+        );
+        assert_eq!(
+            workspace_mount_arg("/tmp/$literal;semi'quote").unwrap(),
+            "--mount=type=bind,src=/tmp/$literal;semi'quote,dst=/workspace"
+        );
+        assert!(
+            !workspace_mount_arg("/tmp/work space")
+                .unwrap()
+                .ends_with(",rw")
+        );
+        assert!(workspace_mount_arg("/tmp/a,b").is_err());
+        assert!(workspace_mount_arg("/tmp/a\nwork").is_err());
+        assert_eq!(
+            tmpfs_mount_arg(),
+            "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=67108864"
         );
     }
 
@@ -530,11 +652,139 @@ mod tests {
         assert!(calls.contains("--pids-limit=12"));
         assert!(calls.contains("--user=1001:1002"));
         assert!(calls.contains("TASK_MODE=verify"));
+        assert!(calls.contains("--mount=type=bind,src="));
+        assert!(calls.contains("dst=/workspace"));
+        assert!(calls.contains("--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=67108864"));
         assert!(!calls.contains("docker.sock"));
         assert!(!calls.contains("--privileged"));
         assert!(calls.contains(&format!("rm --volumes {id}")));
         assert!(!calls.contains(&format!("rm --force --volumes {id}")));
         session.destroy().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn definite_create_failure_does_not_attempt_inspection_or_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("docker-mock");
+        let log = root.path().join("calls.log");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = create ]; then echo 'invalid field rw must be a key=value pair' >&2; exit 1; fi\n", log.display())).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let limits = ResourceLimits {
+            timeout: Duration::from_secs(1),
+            memory_bytes: 1024,
+            cpu_count: 1.0,
+            pids: 4,
+            stdout_bytes: 100,
+            stderr_bytes: 100,
+        };
+        let config = SandboxConfig {
+            execution_id: id,
+            workspace: workspace.path().into(),
+            image: "fixture".into(),
+            uid: 1001,
+            gid: 1001,
+            environment: Default::default(),
+            limits: limits.clone(),
+        };
+        let mut session = DockerSandbox::new(script).create(config).await.unwrap();
+        let error = session
+            .execute(
+                SandboxCommand {
+                    executable: "sh".into(),
+                    args: vec![],
+                },
+                limits,
+                watch::channel(false).1,
+            )
+            .await
+            .unwrap_err();
+        match error {
+            SandboxError::Creation { primary, cleanup } => {
+                assert!(primary.contains("invalid field rw"));
+                assert_eq!(cleanup, None);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        assert!(calls.lines().next().unwrap().starts_with("create "));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_creation_inspects_labels_and_only_removes_verified_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        for mismatched_labels in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let script = root.path().join("docker-mock");
+            let log = root.path().join("calls.log");
+            let execution = Uuid::new_v4();
+            let labels = if mismatched_labels {
+                "false|other"
+            } else {
+                "true|EXECUTION_ID"
+            };
+            let labels = labels.replace("EXECUTION_ID", &execution.to_string());
+            let body = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n create) echo 'connection reset by peer' >&2; exit 1 ;;\n ps) for arg in \"$@\"; do case \"$arg\" in name=*) printf '%s\\n' \"${{arg#name=}}\" ;; esac; done ;;\n inspect) echo '{}' ;;\n rm) exit 0 ;;\nesac\n",
+                log.display(),
+                labels
+            );
+            std::fs::write(&script, body).unwrap();
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&script, permissions).unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let limits = ResourceLimits {
+                timeout: Duration::from_secs(1),
+                memory_bytes: 1024,
+                cpu_count: 1.0,
+                pids: 4,
+                stdout_bytes: 100,
+                stderr_bytes: 100,
+            };
+            let config = SandboxConfig {
+                execution_id: execution,
+                workspace: workspace.path().into(),
+                image: "fixture".into(),
+                uid: 1001,
+                gid: 1001,
+                environment: Default::default(),
+                limits: limits.clone(),
+            };
+            let mut session = DockerSandbox::new(script).create(config).await.unwrap();
+            let error = session
+                .execute(
+                    SandboxCommand {
+                        executable: "task".into(),
+                        args: vec![],
+                    },
+                    limits,
+                    watch::channel(false).1,
+                )
+                .await
+                .unwrap_err();
+            match error {
+                SandboxError::Creation { primary, cleanup } => {
+                    assert!(primary.contains("connection reset"));
+                    assert_eq!(cleanup.is_some(), mismatched_labels);
+                    if let Some(error) = cleanup {
+                        assert!(error.contains("labels do not match"), "{error}");
+                    }
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+            let calls = std::fs::read_to_string(log).unwrap();
+            assert!(calls.contains("ps --all --filter name=synroute-"));
+            assert!(calls.contains("inspect --format"));
+            assert_eq!(calls.contains("rm --force"), !mismatched_labels);
+        }
     }
 
     #[cfg(unix)]
@@ -605,7 +855,7 @@ mod tests {
         let execution = Uuid::new_v4();
         let id = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
         let body = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n create) echo {id}; exec /bin/sleep 5 ;;\n inspect) echo 'true|{execution}' ;;\n rm) exit 0 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n create) echo {id}; exec /bin/sleep 5 ;;\n ps) for arg in \"$@\"; do case \"$arg\" in name=*) printf '%s\\n' \"${{arg#name=}}\" ;; esac; done ;;\n inspect) echo 'true|{execution}' ;;\n rm) exit 0 ;;\nesac\n",
             log.display()
         );
         std::fs::write(&script, body).unwrap();
@@ -642,7 +892,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("docker create failed"));
+        assert!(
+            matches!(error, SandboxError::Creation { primary, cleanup: None } if primary.contains("TimedOut"))
+        );
         let calls = std::fs::read_to_string(log).unwrap();
         assert!(calls.contains("inspect --format"));
         assert!(calls.contains("rm --force --volumes synroute-"));
