@@ -4,6 +4,7 @@ pub mod demo;
 pub mod execution;
 mod git;
 pub mod memory;
+pub mod models;
 pub mod observability;
 pub mod recovery;
 pub mod repository;

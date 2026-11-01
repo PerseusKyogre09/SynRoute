@@ -77,6 +77,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Discover and list configured OpenAI-compatible model providers.
+    Models {
+        #[arg(long)]
+        json: bool,
+        /// Query providers now (otherwise configured IDs are listed without a request).
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[tokio::main]
@@ -87,6 +95,44 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Command::Models { json, refresh } = &cli.command {
+        let config = synroute::models::RegistryConfig::load().await?;
+        let snapshot = synroute::models::discover(&config, *refresh).await;
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        } else {
+            for provider in snapshot.providers {
+                println!(
+                    "{}: {}",
+                    provider.provider_id,
+                    if provider.available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                );
+                if let Some(error) = provider.error {
+                    println!("  Error: {error}");
+                }
+                for model in provider.models {
+                    println!(
+                        "  {} — {} [{}] context={} capabilities={}",
+                        model.model_id,
+                        model.display_name,
+                        if model.local { "local" } else { "remote" },
+                        model
+                            .context_window
+                            .map_or_else(|| "unknown".into(), |n| n.to_string()),
+                        model
+                            .capabilities
+                            .as_ref()
+                            .map_or_else(|| "unknown".into(), |c| c.join(","))
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     let command = match cli.command {
         Command::Profile {
             repository,
@@ -259,6 +305,9 @@ async fn main() -> Result<()> {
             } else {
                 print_stats(stats);
             }
+        }
+        Command::Models { .. } => {
+            unreachable!("models command returned before database initialization")
         }
     }
     Ok(())
