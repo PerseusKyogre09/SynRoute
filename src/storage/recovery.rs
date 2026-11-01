@@ -107,6 +107,7 @@ impl SqliteRecoveryRepository {
     pub(crate) async fn recover_expired_lease(
         &self,
         observed: &ExecutionLease,
+        observed_state: crate::core::ExecutionState,
         now: DateTime<Utc>,
         details: Value,
     ) -> Result<Option<ExecutionRecord>, StorageError> {
@@ -130,6 +131,11 @@ impl SqliteRecoveryRepository {
         };
         let lease = decode_lease(&row)?;
         if lease.owner_id != observed.owner_id
+            || lease.process_id != observed.process_id
+            || lease.process_start != observed.process_start
+            || lease.boot_id != observed.boot_id
+            || lease.heartbeat_at != observed.heartbeat_at
+            || lease.expires_at != observed.expires_at
             || lease.generation != observed.generation
             || lease.expires_at > now
         {
@@ -141,7 +147,7 @@ impl SqliteRecoveryRepository {
             .fetch_one(&mut *tx)
             .await?;
         let from = state_from_db(&current)?;
-        if from.is_terminal() {
+        if from.is_terminal() || from != observed_state {
             tx.rollback().await?;
             return Ok(None);
         }

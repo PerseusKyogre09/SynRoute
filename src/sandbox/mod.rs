@@ -55,12 +55,103 @@ pub struct SandboxCommand {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Termination {
     Exited,
     TimedOut,
     Cancelled,
+    #[default]
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupStatus {
+    NotRequired,
+    Succeeded,
+    Failed,
+    OwnershipUncertain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleanupOutcome {
+    pub status: CleanupStatus,
+    pub container_name: Option<String>,
+    pub container_id: Option<String>,
+    pub container_may_remain: bool,
+    /// Bounded diagnostic text for the caller; durable orphan records use fixed reason codes.
+    pub diagnostic: Option<String>,
+    pub inspection_error: Option<String>,
+    pub cleanup_error: Option<String>,
+}
+
+impl Default for CleanupOutcome {
+    fn default() -> Self {
+        // Legacy evidence has no cleanup proof. Treat it conservatively.
+        Self {
+            status: CleanupStatus::OwnershipUncertain,
+            container_name: None,
+            container_id: None,
+            container_may_remain: true,
+            diagnostic: Some("legacy evidence did not record container cleanup".into()),
+            inspection_error: None,
+            cleanup_error: None,
+        }
+    }
+}
+
+impl CleanupOutcome {
+    pub fn not_required() -> Self {
+        Self {
+            status: CleanupStatus::NotRequired,
+            container_name: None,
+            container_id: None,
+            container_may_remain: false,
+            diagnostic: None,
+            inspection_error: None,
+            cleanup_error: None,
+        }
+    }
+
+    pub fn succeeded(container_name: String, container_id: String) -> Self {
+        Self {
+            status: CleanupStatus::Succeeded,
+            container_name: Some(container_name),
+            container_id: Some(container_id),
+            container_may_remain: false,
+            diagnostic: None,
+            inspection_error: None,
+            cleanup_error: None,
+        }
+    }
+
+    pub fn failed(
+        status: CleanupStatus,
+        container_name: Option<String>,
+        container_id: Option<String>,
+        diagnostic: String,
+    ) -> Self {
+        Self {
+            status,
+            container_name,
+            container_id,
+            container_may_remain: true,
+            diagnostic: Some(diagnostic.clone()),
+            inspection_error: None,
+            cleanup_error: Some(diagnostic),
+        }
+    }
+
+    pub fn is_successful(&self) -> bool {
+        matches!(
+            self.status,
+            CleanupStatus::NotRequired | CleanupStatus::Succeeded
+        ) && !self.container_may_remain
+            && self.inspection_error.is_none()
+            && self.cleanup_error.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +164,8 @@ pub struct ExecutionResult {
     pub stderr_truncated: bool,
     pub termination: Termination,
     pub duration: Duration,
+    pub execution_error: Option<String>,
+    pub cleanup: CleanupOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,7 +205,7 @@ pub trait SandboxSession: Send {
         limits: ResourceLimits,
         cancellation: watch::Receiver<bool>,
     ) -> Result<ExecutionResult, SandboxError>;
-    async fn destroy(&mut self) -> Result<(), SandboxError>;
+    async fn destroy(&mut self) -> Result<CleanupOutcome, SandboxError>;
 }
 
 #[async_trait]

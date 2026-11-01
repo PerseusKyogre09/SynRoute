@@ -1,14 +1,13 @@
 use super::{WorkspaceManager, is_registered};
+use crate::git;
 use crate::storage::{
-    SqliteStorage, WorkspaceOwnershipRecord, WorkspaceRepository, WorkspaceStatus,
+    SqliteStorage, WorkspaceDiagnostic, WorkspaceIssueCode, WorkspaceOwnershipRecord,
+    WorkspaceRepository, WorkspaceStatus,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-};
-use tokio::{io::AsyncWriteExt, process::Command};
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -37,6 +36,27 @@ impl PersistentWorkspaceManager {
             storage,
             volatile: WorkspaceManager::new(),
         }
+    }
+
+    async fn mark_creation_uncertain(
+        &self,
+        original: &WorkspaceOwnershipRecord,
+        code: WorkspaceIssueCode,
+    ) -> Result<()> {
+        let uncertain = self
+            .storage
+            .workspaces()
+            .set_status(
+                original.workspace_id,
+                WorkspaceStatus::Uncertain,
+                None,
+                None,
+                Some(WorkspaceDiagnostic::new(code)),
+            )
+            .await?;
+        update_sidecar(original, &uncertain)
+            .await
+            .context("workspace uncertainty persisted in SQLite but sidecar update failed")
     }
 
     /// Reserves ownership durably before `git worktree add`; a crash gap leaves an uncertain record, never implicit ownership.
@@ -75,6 +95,8 @@ impl PersistentWorkspaceManager {
             sidecar_path: base.join(format!(".synroute-workspace-{workspace_id}.json")),
             ownership_token: Uuid::new_v4(),
             status: WorkspaceStatus::Preparing,
+            uncertainty_code: None,
+            uncertainty_detail: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -83,19 +105,109 @@ impl PersistentWorkspaceManager {
             .reserve(&record)
             .await
             .context("reserve durable workspace ownership")?;
-        write_sidecar(&record)
-            .await
-            .context("write initial workspace ownership metadata")?;
+        if let Err(error) = create_sidecar(&record).await {
+            let code = if error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+            {
+                WorkspaceIssueCode::ExistingSidecar
+            } else {
+                WorkspaceIssueCode::SidecarUpdateFailed
+            };
+            self.storage
+                .workspaces()
+                .set_status(
+                    workspace_id,
+                    WorkspaceStatus::Uncertain,
+                    None,
+                    None,
+                    Some(WorkspaceDiagnostic::new(code)),
+                )
+                .await
+                .context(
+                    "sidecar creation failed and workspace uncertainty could not be persisted",
+                )?;
+            return Err(error).context("write initial workspace ownership metadata");
+        }
 
-        let path = self
+        let path = match self
             .volatile
             .create(&repository, &base, workspace_id, revision)
             .await
-            .context("create Git worktree")?;
-        let git_admin = canonical_git_dir(&path, "--git-dir").await?;
-        let git_common = canonical_git_dir(&path, "--git-common-dir").await?;
-        if !is_registered(&repository, &path).await? {
-            bail!("created worktree is not registered with Git");
+        {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(
+                    match self
+                        .mark_creation_uncertain(&record, WorkspaceIssueCode::GitOperationFailed)
+                        .await
+                    {
+                        Ok(()) => error.context("create Git worktree; workspace marked uncertain"),
+                        Err(mark_error) => error.context(format!(
+                            "create Git worktree and persist uncertainty failed: {mark_error}"
+                        )),
+                    },
+                );
+            }
+        };
+        let git_admin = match canonical_git_dir(&path, "--git-dir").await {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(
+                    match self
+                        .mark_creation_uncertain(&record, WorkspaceIssueCode::GitInspectionFailed)
+                        .await
+                    {
+                        Ok(()) => error.context("inspect new worktree; ownership is uncertain"),
+                        Err(mark_error) => error.context(format!(
+                            "inspect new worktree and persist uncertainty failed: {mark_error}"
+                        )),
+                    },
+                );
+            }
+        };
+        let git_common = match canonical_git_dir(&path, "--git-common-dir").await {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(
+                    match self
+                        .mark_creation_uncertain(&record, WorkspaceIssueCode::GitInspectionFailed)
+                        .await
+                    {
+                        Ok(()) => error.context("inspect new worktree; ownership is uncertain"),
+                        Err(mark_error) => error.context(format!(
+                            "inspect new worktree and persist uncertainty failed: {mark_error}"
+                        )),
+                    },
+                );
+            }
+        };
+        let registered = match is_registered(&repository, &path).await {
+            Ok(registered) => registered,
+            Err(error) => {
+                return Err(match self
+                    .mark_creation_uncertain(&record, WorkspaceIssueCode::GitInspectionFailed)
+                    .await
+                {
+                    Ok(()) => error.context("inspect new worktree registration; ownership is uncertain"),
+                    Err(mark_error) => error.context(format!(
+                        "inspect new worktree registration and persist uncertainty failed: {mark_error}"
+                    )),
+                });
+            }
+        };
+        if !registered {
+            let error = anyhow::anyhow!("created worktree is not registered with Git");
+            return Err(match self
+                .mark_creation_uncertain(&record, WorkspaceIssueCode::RegistrationMissing)
+                .await
+            {
+                Ok(()) => error.context("new worktree registration is uncertain"),
+                Err(mark_error) => error.context(format!(
+                    "new worktree registration is uncertain and persistence failed: {mark_error}"
+                )),
+            });
         }
         let registered = self
             .storage
@@ -105,13 +217,22 @@ impl PersistentWorkspaceManager {
                 WorkspaceStatus::Registered,
                 Some(&git_admin),
                 Some(&git_common),
+                None,
             )
             .await?;
-        if let Err(error) = write_sidecar(&registered).await {
+        if let Err(error) = update_sidecar(&record, &registered).await {
             let uncertain = self
                 .storage
                 .workspaces()
-                .set_status(workspace_id, WorkspaceStatus::Uncertain, None, None)
+                .set_status(
+                    workspace_id,
+                    WorkspaceStatus::Uncertain,
+                    None,
+                    None,
+                    Some(WorkspaceDiagnostic::new(
+                        WorkspaceIssueCode::SidecarUpdateFailed,
+                    )),
+                )
                 .await;
             return match uncertain { Ok(_) => Err(error).context("workspace registry sidecar update failed; ownership marked uncertain"), Err(mark_error) => Err(error).context(format!("workspace registry sidecar update failed and status update failed: {mark_error}")) };
         }
@@ -139,33 +260,50 @@ impl PersistentWorkspaceManager {
                 record.status
             );
         }
-        let requested = tokio::fs::canonicalize(requested_path)
-            .await
-            .context("workspace missing or inaccessible")?;
+        let requested = match tokio::fs::canonicalize(requested_path).await {
+            Ok(path) => path,
+            Err(error) => {
+                if requested_path == record.canonical_path {
+                    store
+                        .set_status(
+                            workspace_id,
+                            WorkspaceStatus::Uncertain,
+                            None,
+                            None,
+                            Some(WorkspaceDiagnostic::new(
+                                WorkspaceIssueCode::WorkspaceUnavailable,
+                            )),
+                        )
+                        .await
+                        .context(
+                            "workspace is missing and its uncertainty could not be persisted",
+                        )?;
+                }
+                return Err(error).context("workspace missing or inaccessible");
+            }
+        };
         if requested != record.canonical_path {
             bail!("requested path does not match persisted workspace path");
         }
-        verify_sidecar(&record).await?;
-        let repository = tokio::fs::canonicalize(&record.repository_root)
-            .await
-            .context("repository missing or inaccessible")?;
-        if repository != record.repository_root {
-            bail!("repository canonical path changed; refusing cleanup");
+        if let Err(issue) = Self::diagnose_record(&record).await {
+            let detail = issue.code.safe_detail();
+            store
+                .set_status(
+                    workspace_id,
+                    WorkspaceStatus::Uncertain,
+                    None,
+                    None,
+                    Some(issue),
+                )
+                .await
+                .context("persist workspace ownership uncertainty")?;
+            bail!("workspace ownership validation failed: {detail}");
         }
-        if !is_registered(&repository, &record.canonical_path).await? {
-            bail!("Git worktree registration is missing; refusing cleanup");
-        }
-        let admin = canonical_git_dir(&record.canonical_path, "--git-dir").await?;
-        let common = canonical_git_dir(&record.canonical_path, "--git-common-dir").await?;
-        if Some(&admin) != record.git_admin_path.as_ref()
-            || Some(&common) != record.git_common_dir.as_ref()
-        {
-            bail!("Git administrative metadata differs from the persisted owner record");
-        }
+        let repository = record.repository_root.clone();
         let removing = store
-            .set_status(workspace_id, WorkspaceStatus::Removing, None, None)
+            .set_status(workspace_id, WorkspaceStatus::Removing, None, None, None)
             .await?;
-        write_sidecar(&removing)
+        update_sidecar(&record, &removing)
             .await
             .context("persist workspace removal intent")?;
         self.volatile.adopt_owned(
@@ -178,71 +316,150 @@ impl PersistentWorkspaceManager {
             .remove(workspace_id, &record.canonical_path)
             .await
         {
-            let still_registered = is_registered(&repository, &record.canonical_path)
+            let updated = match store
+                .set_status(
+                    workspace_id,
+                    WorkspaceStatus::Uncertain,
+                    None,
+                    None,
+                    Some(WorkspaceDiagnostic::new(
+                        WorkspaceIssueCode::GitOperationFailed,
+                    )),
+                )
                 .await
-                .unwrap_or(false);
-            let restore = if still_registered {
-                WorkspaceStatus::Registered
-            } else {
-                WorkspaceStatus::Uncertain
+            {
+                Ok(updated) => updated,
+                Err(mark_error) => {
+                    return Err(error.context(format!(
+                        "cleanup failed and workspace uncertainty could not be persisted: {mark_error}"
+                    )));
+                }
             };
-            if let Ok(updated) = store.set_status(workspace_id, restore, None, None).await {
-                let _ = write_sidecar(&updated).await;
+            if let Err(sidecar_error) = update_sidecar(&removing, &updated).await {
+                return Err(error.context(format!(
+                    "cleanup failed; uncertainty is persisted but sidecar update failed: {sidecar_error}"
+                )));
             }
             return Err(error)
-                .context("safe worktree cleanup refused or failed; workspace retained");
+                .context("safe worktree cleanup failed; workspace is retained as uncertain");
         }
         let removed = store
-            .set_status(workspace_id, WorkspaceStatus::Removed, None, None)
+            .set_status(workspace_id, WorkspaceStatus::Removed, None, None, None)
             .await?;
-        write_sidecar(&removed)
+        update_sidecar(&removing, &removed)
             .await
             .context("persist removed workspace status")?;
         Ok(())
     }
 
-    pub async fn validate_record(record: &WorkspaceOwnershipRecord) -> Result<(), String> {
+    pub async fn diagnose_record(
+        record: &WorkspaceOwnershipRecord,
+    ) -> Result<(), WorkspaceDiagnostic> {
+        if record.status == WorkspaceStatus::Preparing {
+            return Err(WorkspaceDiagnostic::new(
+                WorkspaceIssueCode::InterruptedCreation,
+            ));
+        }
+        if record.status == WorkspaceStatus::Removing {
+            return Err(WorkspaceDiagnostic::new(
+                WorkspaceIssueCode::InterruptedRemoval,
+            ));
+        }
+        if record.status == WorkspaceStatus::Uncertain {
+            return Err(WorkspaceDiagnostic::new(issue_code_from_record(record)));
+        }
+        if verify_sidecar(record).await.is_err() {
+            return Err(sidecar_diagnostic(record).await);
+        }
         if record.status == WorkspaceStatus::Removed {
-            return verify_sidecar(record)
-                .await
-                .map_err(|error| error.to_string());
+            return Ok(());
         }
-        if record.status != WorkspaceStatus::Registered {
-            return Err(format!("workspace status is {:?}", record.status));
-        }
-        verify_sidecar(record)
-            .await
-            .map_err(|error| error.to_string())?;
         let root = tokio::fs::canonicalize(&record.repository_root)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| WorkspaceDiagnostic::new(WorkspaceIssueCode::RepositoryUnavailable))?;
         if root != record.repository_root {
-            return Err("repository root canonicalization mismatch".into());
+            return Err(WorkspaceDiagnostic::new(WorkspaceIssueCode::PathMismatch));
         }
         let path = tokio::fs::canonicalize(&record.canonical_path)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| WorkspaceDiagnostic::new(WorkspaceIssueCode::WorkspaceUnavailable))?;
         if path != record.canonical_path {
-            return Err("workspace path canonicalization mismatch".into());
+            return Err(WorkspaceDiagnostic::new(WorkspaceIssueCode::PathMismatch));
         }
         if !is_registered(&root, &path)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|_| WorkspaceDiagnostic::new(WorkspaceIssueCode::GitInspectionFailed))?
         {
-            return Err("Git registration missing".into());
+            return Err(WorkspaceDiagnostic::new(
+                WorkspaceIssueCode::RegistrationMissing,
+            ));
         }
         let admin = canonical_git_dir(&path, "--git-dir")
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| WorkspaceDiagnostic::new(WorkspaceIssueCode::GitInspectionFailed))?;
         let common = canonical_git_dir(&path, "--git-common-dir")
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| WorkspaceDiagnostic::new(WorkspaceIssueCode::GitInspectionFailed))?;
         if Some(&admin) != record.git_admin_path.as_ref()
             || Some(&common) != record.git_common_dir.as_ref()
         {
-            return Err("Git admin/common directory mismatch".into());
+            return Err(WorkspaceDiagnostic::new(
+                WorkspaceIssueCode::GitMetadataMismatch,
+            ));
         }
         Ok(())
+    }
+
+    pub async fn validate_record(record: &WorkspaceOwnershipRecord) -> Result<(), String> {
+        Self::diagnose_record(record)
+            .await
+            .map_err(|issue| format!("{}: {}", issue.code.as_str(), issue.code.safe_detail()))
+    }
+}
+
+fn issue_code_from_record(record: &WorkspaceOwnershipRecord) -> WorkspaceIssueCode {
+    match record.uncertainty_code.as_deref() {
+        Some("existing_sidecar") => WorkspaceIssueCode::ExistingSidecar,
+        Some("sidecar_missing") => WorkspaceIssueCode::SidecarMissing,
+        Some("sidecar_invalid") => WorkspaceIssueCode::SidecarInvalid,
+        Some("sidecar_mismatch") => WorkspaceIssueCode::SidecarMismatch,
+        Some("repository_unavailable") => WorkspaceIssueCode::RepositoryUnavailable,
+        Some("workspace_unavailable") => WorkspaceIssueCode::WorkspaceUnavailable,
+        Some("workspace_path_mismatch") => WorkspaceIssueCode::PathMismatch,
+        Some("git_registration_missing") => WorkspaceIssueCode::RegistrationMissing,
+        Some("git_metadata_mismatch") => WorkspaceIssueCode::GitMetadataMismatch,
+        Some("git_inspection_failed") => WorkspaceIssueCode::GitInspectionFailed,
+        Some("removal_interrupted_or_incomplete") => WorkspaceIssueCode::InterruptedRemoval,
+        Some("git_operation_failed") => WorkspaceIssueCode::GitOperationFailed,
+        Some("sidecar_update_failed") => WorkspaceIssueCode::SidecarUpdateFailed,
+        _ => WorkspaceIssueCode::InterruptedCreation,
+    }
+}
+
+async fn sidecar_diagnostic(record: &WorkspaceOwnershipRecord) -> WorkspaceDiagnostic {
+    match tokio::fs::symlink_metadata(&record.sidecar_path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            WorkspaceDiagnostic::new(WorkspaceIssueCode::SidecarMissing)
+        }
+        Err(_) => WorkspaceDiagnostic::new(WorkspaceIssueCode::SidecarInvalid),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            WorkspaceDiagnostic::new(WorkspaceIssueCode::SidecarInvalid)
+        }
+        Ok(_) => {
+            if !matches!(
+                tokio::fs::canonicalize(&record.sidecar_path).await,
+                Ok(path) if path == record.sidecar_path
+            ) {
+                return WorkspaceDiagnostic::new(WorkspaceIssueCode::SidecarInvalid);
+            }
+            match tokio::fs::read(&record.sidecar_path).await {
+                Err(_) => WorkspaceDiagnostic::new(WorkspaceIssueCode::SidecarInvalid),
+                Ok(bytes) => match serde_json::from_slice::<OwnershipSidecar>(&bytes) {
+                    Err(_) => WorkspaceDiagnostic::new(WorkspaceIssueCode::SidecarInvalid),
+                    Ok(_) => WorkspaceDiagnostic::new(WorkspaceIssueCode::SidecarMismatch),
+                },
+            }
+        }
     }
 }
 
@@ -291,7 +508,28 @@ fn sidecar_for(record: &WorkspaceOwnershipRecord) -> OwnershipSidecar {
     }
 }
 
-async fn write_sidecar(record: &WorkspaceOwnershipRecord) -> Result<()> {
+async fn create_sidecar(record: &WorkspaceOwnershipRecord) -> Result<()> {
+    let bytes = serde_json::to_vec(&sidecar_for(record))?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&record.sidecar_path)
+        .await
+        .context("reserve ownership sidecar exclusively")?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+async fn update_sidecar(
+    previous: &WorkspaceOwnershipRecord,
+    record: &WorkspaceOwnershipRecord,
+) -> Result<()> {
+    verify_sidecar(previous).await?;
     let bytes = serde_json::to_vec(&sidecar_for(record))?;
     let temporary = record
         .sidecar_path
@@ -306,18 +544,15 @@ async fn write_sidecar(record: &WorkspaceOwnershipRecord) -> Result<()> {
     file.write_all(&bytes).await?;
     file.sync_all().await?;
     drop(file);
-    tokio::fs::rename(&temporary, &record.sidecar_path).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, &record.sidecar_path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
     Ok(())
 }
 
 async fn git_path(repository: &Path, args: &[&str]) -> Result<PathBuf> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repository)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
+    let output = git::output(repository, args, false).await?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -336,13 +571,7 @@ async fn git_path(repository: &Path, args: &[&str]) -> Result<PathBuf> {
 }
 
 async fn canonical_git_dir(worktree: &Path, flag: &str) -> Result<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", flag])
-        .current_dir(worktree)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
+    let output = git::output(worktree, &["rev-parse", flag], true).await?;
     if !output.status.success() {
         bail!(
             "git rev-parse {flag} failed: {}",
@@ -432,6 +661,7 @@ mod tests {
                     process_limit: 4,
                     output_limit_bytes: 1024,
                 },
+                required_verification: Vec::new(),
             })
             .await
             .unwrap();
@@ -537,5 +767,231 @@ mod tests {
             .to_string();
         assert!(error.contains("sidecar"));
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn initial_sidecar_creation_preserves_existing_file_and_id_collision() {
+        let root = tempfile::tempdir().unwrap();
+        let db_file = root.path().join("store.sqlite");
+        let db = SqliteStorage::open(&db_file).await.unwrap();
+        let repository = git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let execution_id = execution(&db, repository.path()).await;
+        let workspace_id = Uuid::new_v4();
+        let revision = String::from_utf8(
+            StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repository.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let sidecar = base
+            .path()
+            .join(format!(".synroute-workspace-{workspace_id}.json"));
+        let original = b"user-owned metadata; preserve exactly";
+        tokio::fs::write(&sidecar, original).await.unwrap();
+
+        let mut manager = PersistentWorkspaceManager::new(db.clone());
+        assert!(
+            manager
+                .create(
+                    execution_id,
+                    workspace_id,
+                    "fixture-repo".into(),
+                    repository.path(),
+                    base.path(),
+                    revision.trim(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read(&sidecar).await.unwrap(), original);
+        let record = db.workspaces().workspace(workspace_id).await.unwrap();
+        assert_eq!(record.status, WorkspaceStatus::Uncertain);
+        assert_eq!(record.uncertainty_code.as_deref(), Some("existing_sidecar"));
+
+        // A later attempt with the same workspace ID must not replace that sidecar either.
+        assert!(
+            manager
+                .create(
+                    execution_id,
+                    workspace_id,
+                    "fixture-repo".into(),
+                    repository.path(),
+                    base.path(),
+                    revision.trim(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read(&sidecar).await.unwrap(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn workspace_uncertainty_reasons_survive_restart_for_validation_and_crash_states() {
+        use std::os::unix::fs::symlink;
+
+        for scenario in [
+            "missing_sidecar",
+            "path_mismatch",
+            "registration_missing",
+            "preparing",
+            "removing",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let db_file = root.path().join("store.sqlite");
+            let db = SqliteStorage::open(&db_file).await.unwrap();
+            let repository = git_repo();
+            let base = tempfile::tempdir().unwrap();
+            let execution_id = execution(&db, repository.path()).await;
+            let workspace_id = Uuid::new_v4();
+            let revision = String::from_utf8(
+                StdCommand::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(repository.path())
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap();
+            let mut manager = PersistentWorkspaceManager::new(db.clone());
+            let path = manager
+                .create(
+                    execution_id,
+                    workspace_id,
+                    "fixture-repo".into(),
+                    repository.path(),
+                    base.path(),
+                    revision.trim(),
+                )
+                .await
+                .unwrap();
+            let record = db.workspaces().workspace(workspace_id).await.unwrap();
+
+            match scenario {
+                "missing_sidecar" => tokio::fs::remove_file(&record.sidecar_path).await.unwrap(),
+                "path_mismatch" => {
+                    let moved = path.with_extension("moved");
+                    tokio::fs::rename(&path, &moved).await.unwrap();
+                    symlink(&moved, &path).unwrap();
+                }
+                "registration_missing" => {
+                    let path_text = path.to_str().unwrap();
+                    let output =
+                        git::output(repository.path(), &["worktree", "remove", path_text], true)
+                            .await
+                            .unwrap();
+                    assert!(output.status.success());
+                    tokio::fs::create_dir(&path).await.unwrap();
+                }
+                "preparing" => {
+                    // The status models a process crash after durable reservation.
+                    let preparing = db.workspaces().workspace(workspace_id).await.unwrap();
+                    let mut conn = db.pool().acquire().await.unwrap();
+                    sqlx::query(
+                        "UPDATE workspaces SET status = 'preparing' WHERE workspace_id = ?",
+                    )
+                    .bind(workspace_id.to_string())
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+                    drop(preparing);
+                }
+                "removing" => {
+                    db.workspaces()
+                        .set_status(workspace_id, WorkspaceStatus::Removing, None, None, None)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let service = crate::recovery::RecoveryService::new(db.clone());
+            let mut report = service
+                .inspect_startup(None, chrono::Utc::now())
+                .await
+                .unwrap();
+            service.apply_safe_recovery(&mut report).await.unwrap();
+
+            let reopened = SqliteStorage::open(&db_file).await.unwrap();
+            let persisted = reopened.workspaces().workspace(workspace_id).await.unwrap();
+            assert_eq!(persisted.status, WorkspaceStatus::Uncertain, "{scenario}");
+            assert!(persisted.uncertainty_code.is_some(), "{scenario}");
+            assert!(persisted.uncertainty_detail.is_some(), "{scenario}");
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_workspace_for_terminal_execution_remains_in_recovery_report() {
+        use crate::{
+            core::ExecutionState,
+            storage::{ExecutionRepository, FailureClassification},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let db_file = root.path().join("store.sqlite");
+        let db = SqliteStorage::open(&db_file).await.unwrap();
+        let repository = git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let execution_id = execution(&db, repository.path()).await;
+        let workspace_id = Uuid::new_v4();
+        let revision = String::from_utf8(
+            StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repository.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let mut manager = PersistentWorkspaceManager::new(db.clone());
+        manager
+            .create(
+                execution_id,
+                workspace_id,
+                "fixture-repo".into(),
+                repository.path(),
+                base.path(),
+                revision.trim(),
+            )
+            .await
+            .unwrap();
+        db.executions()
+            .transition(
+                execution_id,
+                ExecutionState::Failed,
+                Some(FailureClassification::Unknown),
+            )
+            .await
+            .unwrap();
+        let record = db.workspaces().workspace(workspace_id).await.unwrap();
+        tokio::fs::remove_file(&record.sidecar_path).await.unwrap();
+
+        let service = crate::recovery::RecoveryService::new(db.clone());
+        let mut report = service
+            .inspect_startup(None, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(report.executions().is_empty());
+        assert!(report.requires_attention());
+        assert_eq!(report.workspace_issues().len(), 1);
+        service.apply_safe_recovery(&mut report).await.unwrap();
+
+        let reopened = SqliteStorage::open(&db_file).await.unwrap();
+        let persisted = reopened.workspaces().workspace(workspace_id).await.unwrap();
+        assert_eq!(persisted.status, WorkspaceStatus::Uncertain);
+        assert_eq!(
+            persisted.uncertainty_code.as_deref(),
+            Some("sidecar_missing")
+        );
+        let next_report = crate::recovery::RecoveryService::new(reopened)
+            .inspect_startup(None, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(next_report.workspace_issues().len(), 1);
+        assert!(next_report.requires_attention());
     }
 }

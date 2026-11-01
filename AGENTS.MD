@@ -100,7 +100,9 @@ Responsible for:
 
 **A Git worktree is source-control isolation, not a security sandbox.**
 
-Persistent workspace cleanup requires agreement between the SQLite owner record, the local ownership sidecar, and Git worktree registration. Uncertain or inconsistent ownership means cleanup is refused; never force-remove a worktree.
+Persistent workspace cleanup requires agreement between the SQLite owner record, the local ownership sidecar, and Git worktree registration. Uncertain or inconsistent ownership means cleanup is refused; never force-remove a worktree. Persist uncertainty as a bounded reason code and safe diagnostic detail, and keep non-removed workspace issues visible in recovery reports even after their execution becomes terminal.
+
+Every runtime Git subprocess must use the isolated launcher in `src/git.rs`. It clears inherited environment variables, ignores system/global Git config, overrides hooks/fsmonitor/external diff settings, and disables repository-configured clean/smudge/process filters for worktree inspection and mutation. These are host-side Git operations, not a sandbox. The Git executable and PATH selected by the host remain trusted; do not add arbitrary repository-controlled Git commands.
 
 ### Execution Engine
 
@@ -113,9 +115,9 @@ Responsible for:
 
 Execution records and append-only event history are stored through `storage`; do not add SQL queries to domain or orchestration modules. Execution intent must be committed before launching an external process. Lifecycle changes and their corresponding events must share one transaction. SQLite migrations are versioned and must preserve existing data.
 
-Execution creation must acquire a durable owner lease in the same transaction as execution intent. Lease owners must renew before expiry (default 45 seconds; maximum 300 seconds). On Linux, owner identity includes a random storage-instance UUID, PID, process start ticks, and boot ID; PID alone is never sufficient. Startup recovery must separate read-only inspection from mutation, and may transition to `RecoveryRequired` only when the lease has expired and the exact owner process identity is confirmed inactive. Unknown liveness must be reported in a durable recovery case without changing execution state or lease. Recovery must never resume executions or delete workspaces/containers. Open recovery cases remain visible until acknowledged or resolved and remain queryable as history afterward. There is no heartbeat worker or execution coordinator yet; future execution code must renew leases explicitly.
+Execution creation must acquire a durable owner lease in the same transaction as execution intent. Ownership is create-only: this implementation has no lease takeover or transfer operation. Each mutation checks the originating process identity before the transaction and validates the storage-instance UUID, lease generation, and expiry within the SQLite mutation transaction. Expired leases cannot be renewed; a restarted storage instance cannot resume an old lease. Owners must renew before expiry (default 45 seconds; maximum 300 seconds). On Linux, owner identity includes a random storage-instance UUID, PID, process start ticks, and boot ID; PID alone is never sufficient. Startup recovery must separate read-only inspection from mutation, reload the authoritative lease from SQLite, and may transition to `RecoveryRequired` only when the lease has expired and the exact persisted owner process identity is confirmed inactive. Caller-edited report fields must never authorize recovery. Unknown liveness must be reported in a durable recovery case without changing execution state or lease. Recovery must never resume executions or delete workspaces/containers. Open recovery cases remain visible until acknowledged or resolved and remain queryable as history afterward. There is no heartbeat worker or execution coordinator yet; future execution code must renew leases explicitly.
 
-`Completed` is reserved for a non-empty latest verification report whose overall status and every check status are passing. Enforce this in the SQLite repository transaction and in database triggers; keep verification evidence insertion and its event atomic. Never trust provider-reported agent completion as verification evidence.
+Each execution persists an immutable verification contract: uniquely named required checks with exact argv, bound to an execution-specific version UUID. The crate-private trusted verification path loads that contract, runs every check through the verification runner, and atomically stores its actual result with its event. Caller-supplied reports cannot enter the persistence API. `Completed` is reserved for a latest report bound to that version with exactly one result for every required check, all passing. SQLite additionally rejects evidence outside `VERIFYING`, evidence edits/deletes, contract mismatches, and completion without the full passing contract. These controls defend the in-process API boundary; they do not prove provenance against a user with direct SQLite write access. Never trust provider-reported agent completion as verification evidence.
 
 ### Verification Engine
 
@@ -197,15 +199,16 @@ Security is a first-class architectural requirement.
 
 ### Never execute untrusted commands directly
 
-Until a real sandbox implementation exists:
+Repository-controlled commands must always go through explicit authorization and a configured sandbox:
 
-- Do not execute arbitrary commands discovered from a repository.
+- Do not execute repository-discovered command hints automatically.
 - Do not execute agent-generated shell commands on the host.
+- Use structured argv and fail closed when authorization or sandbox configuration is missing.
 - Do not claim that Git worktrees provide execution security.
-- Restrict verification to explicitly approved, trusted operations.
-- Make unsupported execution paths fail safely and clearly.
+- Require explicit approval for commands marked approval-required.
+- Make denied and unsupported execution paths fail safely and clearly.
 
-### Future sandbox requirements
+### Sandbox requirements
 
 The execution environment should support:
 
@@ -220,6 +223,8 @@ The execution environment should support:
 - Explicit approval for destructive or external operations.
 
 Do not build a custom container runtime. Prefer established isolation technologies.
+
+Docker execution currently requires configured SQLite storage. Persist a unique execution-scoped container name and random ownership token before calling Docker; persist the returned container ID before starting it. Keep unresolved intent and fixed-detail cleanup diagnostics visible through recovery/report APIs after restart. Never remove a resource based only on its name: inspect the exact container ID and verify the expected name, managed label, execution ID, and token label. Docker create and attached start share one monotonic operation deadline; pass caller cancellation to both. Cleanup receives a separate 15-second grace deadline, and session destruction shares one grace deadline across its resources. Preserve the primary termination, exit status, bounded output, and truncation independently from cleanup status. Cleanup uncertainty or failure must prevent a passing verification result. These measures support ownership and diagnostics; they do not make Docker a complete security boundary.
 
 ### Additional requirements
 

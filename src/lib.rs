@@ -1,7 +1,10 @@
 pub mod agent;
 pub mod core;
+pub mod demo;
 pub mod execution;
+mod git;
 pub mod memory;
+pub mod observability;
 pub mod recovery;
 pub mod repository;
 pub mod sandbox;

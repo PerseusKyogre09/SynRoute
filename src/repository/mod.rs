@@ -1,10 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-};
-use tokio::process::Command;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryProfile {
@@ -72,14 +68,9 @@ async fn exists(root: &Path, file: &str) -> Result<bool> {
 }
 
 async fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let output = crate::git::output(root, args, false)
         .await
-        .context("could not start Git")?;
+        .context("could not start isolated Git")?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",

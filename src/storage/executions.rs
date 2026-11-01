@@ -13,6 +13,10 @@ pub trait ExecutionRepository: Send + Sync {
         intent: ExecutionIntent,
     ) -> Result<ExecutionRecord, StorageError>;
     async fn execution(&self, id: Uuid) -> Result<ExecutionRecord, StorageError>;
+    async fn list_executions(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<Vec<ExecutionRecord>, StorageError>;
     async fn transition(
         &self,
         id: Uuid,
@@ -26,11 +30,6 @@ pub trait ExecutionRepository: Send + Sync {
         payload: Value,
     ) -> Result<ExecutionEvent, StorageError>;
     async fn events(&self, id: Uuid) -> Result<Vec<ExecutionEvent>, StorageError>;
-    async fn record_verification(
-        &self,
-        id: Uuid,
-        report: crate::verification::VerificationReport,
-    ) -> Result<(), StorageError>;
     async fn verifications(&self, id: Uuid) -> Result<Vec<VerificationRecord>, StorageError>;
     async fn nonterminal_executions(&self) -> Result<Vec<ExecutionRecord>, StorageError>;
     async fn report(&self, id: Uuid) -> Result<ExecutionReport, StorageError>;
@@ -55,6 +54,7 @@ impl ExecutionRepository for SqliteExecutionRepository {
         &self,
         intent: ExecutionIntent,
     ) -> Result<ExecutionRecord, StorageError> {
+        ensure_originating_process(&self.owner)?;
         if intent.description.trim().is_empty()
             || intent.repository_identity.trim().is_empty()
             || intent.repository_revision.trim().is_empty()
@@ -69,18 +69,23 @@ impl ExecutionRepository for SqliteExecutionRepository {
             ));
         }
         check_sensitive_keys(&intent.metadata)?;
+        validate_verification_contract(&intent.required_verification)?;
         let now = Utc::now();
         let metadata = serde_json::to_string(&intent.metadata)?;
         let task = serde_json::to_string(
             &json!({"description": intent.description, "metadata": intent.metadata}),
         )?;
         let config = serde_json::to_string(&intent.config)?;
+        let contract_version = Uuid::new_v4();
+        let checks_json = serde_json::to_string(&intent.required_verification)?;
         let state = state_to_db(crate::core::ExecutionState::Received);
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO executions (id, repository_root, repository_revision, task_json, created_at, task_description, task_metadata_json, repository_identity, working_directory, state, updated_at, execution_config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(intent.id.to_string()).bind(intent.repository_root.to_string_lossy().as_ref()).bind(&intent.repository_revision).bind(task).bind(timestamp(now))
             .bind(&intent.description).bind(metadata).bind(&intent.repository_identity).bind(intent.working_directory.to_string_lossy().as_ref()).bind(&state).bind(timestamp(now)).bind(config)
             .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO verification_contracts (execution_id, version, checks_json, created_at) VALUES (?, ?, ?, ?)")
+            .bind(intent.id.to_string()).bind(contract_version.to_string()).bind(checks_json).bind(timestamp(now)).execute(&mut *tx).await?;
         let lease_expiry = lease_expiry(now, DEFAULT_LEASE_TTL)?;
         sqlx::query("INSERT INTO execution_leases (execution_id, owner_id, owner_pid, process_start, boot_id, heartbeat_at, expires_at, generation) VALUES (?, ?, ?, ?, ?, ?, ?, 1)")
             .bind(intent.id.to_string()).bind(self.owner.owner_id.to_string()).bind(self.owner.process_id.map(i64::from)).bind(&self.owner.process_start).bind(&self.owner.boot_id).bind(timestamp(now)).bind(timestamp(lease_expiry)).execute(&mut *tx).await?;
@@ -108,12 +113,30 @@ impl ExecutionRepository for SqliteExecutionRepository {
         decode_execution(&row)
     }
 
+    async fn list_executions(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<Vec<ExecutionRecord>, StorageError> {
+        let rows = if let Some(limit) = limit {
+            sqlx::query("SELECT * FROM executions ORDER BY created_at DESC, id DESC LIMIT ?")
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query("SELECT * FROM executions ORDER BY created_at DESC, id DESC")
+                .fetch_all(&self.pool)
+                .await?
+        };
+        rows.iter().map(decode_execution).collect()
+    }
+
     async fn transition(
         &self,
         id: Uuid,
         to: crate::core::ExecutionState,
         failure: Option<FailureClassification>,
     ) -> Result<ExecutionRecord, StorageError> {
+        ensure_originating_process(&self.owner)?;
         if to == crate::core::ExecutionState::RecoveryRequired {
             return Err(StorageError::Invalid(
                 "RecoveryRequired may only be written by the atomic recovery repository operation"
@@ -134,6 +157,7 @@ impl ExecutionRepository for SqliteExecutionRepository {
                 id: id_text,
             });
         }
+        validate_owner_tx(&mut tx, id, &self.owner, now).await?;
         let current: String = sqlx::query_scalar("SELECT state FROM executions WHERE id = ?")
             .bind(&id_text)
             .fetch_one(&mut *tx)
@@ -217,6 +241,12 @@ impl ExecutionRepository for SqliteExecutionRepository {
         event_type: ExecutionEventType,
         payload: Value,
     ) -> Result<ExecutionEvent, StorageError> {
+        ensure_originating_process(&self.owner)?;
+        if !event_type.is_owner_appendable() {
+            return Err(StorageError::Invalid(format!(
+                "event type {event_type:?} is reserved for atomic lifecycle or evidence operations"
+            )));
+        }
         check_sensitive_keys(&payload)?;
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
@@ -231,6 +261,7 @@ impl ExecutionRepository for SqliteExecutionRepository {
                 id: id.to_string(),
             });
         }
+        validate_owner_tx(&mut tx, id, &self.owner, now).await?;
         let event = append_event_tx(&mut tx, id, event_type, payload, now).await?;
         tx.commit().await?;
         Ok(event)
@@ -242,56 +273,18 @@ impl ExecutionRepository for SqliteExecutionRepository {
         rows.iter().map(decode_event).collect()
     }
 
-    async fn record_verification(
-        &self,
-        id: Uuid,
-        report: crate::verification::VerificationReport,
-    ) -> Result<(), StorageError> {
-        validate_verification_report(&report)?;
-        let report_json = serde_json::to_value(&report)?;
-        check_sensitive_keys(&report_json)?;
-        let mut tx = self.pool.begin().await?;
-        let now = Utc::now();
-        let locked = sqlx::query("UPDATE executions SET updated_at = ? WHERE id = ?")
-            .bind(timestamp(now))
-            .bind(id.to_string())
-            .execute(&mut *tx)
-            .await?;
-        if locked.rows_affected() == 0 {
-            return Err(StorageError::NotFound {
-                entity: "execution",
-                id: id.to_string(),
-            });
-        }
-        let state: String = sqlx::query_scalar("SELECT state FROM executions WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_one(&mut *tx)
-            .await?;
-        if state_from_db(&state)? != crate::core::ExecutionState::Verifying {
-            return Err(StorageError::Invalid(
-                "verification evidence can only be recorded while execution is verifying".into(),
-            ));
-        }
-        sqlx::query("INSERT INTO verification_evidence (execution_id, report_json, occurred_at, status) VALUES (?, ?, ?, ?)")
-            .bind(id.to_string()).bind(serde_json::to_string(&report_json)?).bind(timestamp(now)).bind(verification_status_str(report.status)).execute(&mut *tx).await?;
-        append_event_tx(
-            &mut tx,
-            id,
-            ExecutionEventType::VerificationCompleted,
-            json!({"status": report.status}),
-            now,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     async fn verifications(&self, id: Uuid) -> Result<Vec<VerificationRecord>, StorageError> {
-        let rows = sqlx::query("SELECT report_json, occurred_at FROM verification_evidence WHERE execution_id = ? ORDER BY id ASC").bind(id.to_string()).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT report_json, occurred_at, contract_version FROM verification_evidence WHERE execution_id = ? ORDER BY id ASC").bind(id.to_string()).fetch_all(&self.pool).await?;
         rows.iter()
             .map(|row| {
                 Ok(VerificationRecord {
                     created_at: parse_timestamp(row.try_get("occurred_at")?)?,
+                    contract_version: Uuid::parse_str(
+                        &row.try_get::<String, _>("contract_version")?,
+                    )
+                    .map_err(|error| {
+                        StorageError::Invalid(format!("invalid evidence contract version: {error}"))
+                    })?,
                     report: serde_json::from_str(row.try_get("report_json")?)?,
                 })
             })
@@ -315,16 +308,26 @@ impl ExecutionRepository for SqliteExecutionRepository {
 
     async fn report(&self, id: Uuid) -> Result<ExecutionReport, StorageError> {
         let execution = self.execution(id).await?;
+        let verification_contract = self.verification_contract(id).await?;
         let events = self.events(id).await?;
         let workspaces = SqliteWorkspaceRepository::new(self.pool.clone())
             .for_execution(id)
             .await?;
         let verifications = self.verifications(id).await?;
+        let container_diagnostics = SqliteContainerDiagnosticRepository::new(self.pool.clone())
+            .for_execution(id)
+            .await?;
+        let container_intents = SqliteContainerDiagnosticRepository::new(self.pool.clone())
+            .intents_for_execution(id)
+            .await?;
         Ok(ExecutionReport {
             execution,
+            verification_contract,
             events,
             workspaces,
             verifications,
+            container_diagnostics,
+            container_intents,
         })
     }
 
@@ -337,15 +340,7 @@ impl ExecutionRepository for SqliteExecutionRepository {
     }
 
     async fn renew_lease(&self, id: Uuid, ttl: Duration) -> Result<ExecutionLease, StorageError> {
-        let current_owner = OwnerIdentity::current();
-        if current_owner.process_id != self.owner.process_id
-            || current_owner.process_start != self.owner.process_start
-            || current_owner.boot_id != self.owner.boot_id
-        {
-            return Err(StorageError::Invalid(
-                "execution lease can only be renewed by the originating process identity".into(),
-            ));
-        }
+        ensure_originating_process(&self.owner)?;
         let now = Utc::now();
         let expires_at = lease_expiry(now, ttl)?;
         let mut tx = self.pool.begin().await?;
@@ -368,17 +363,194 @@ impl ExecutionRepository for SqliteExecutionRepository {
                 "terminal executions cannot renew an owner lease".into(),
             ));
         }
-        let updated = sqlx::query("UPDATE execution_leases SET heartbeat_at = ?, expires_at = ? WHERE execution_id = ? AND owner_id = ?")
-            .bind(timestamp(now)).bind(timestamp(expires_at)).bind(id.to_string()).bind(self.owner.owner_id.to_string()).execute(&mut *tx).await?;
+        let row = sqlx::query("SELECT * FROM execution_leases WHERE execution_id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Err(StorageError::Invalid(
+                "execution lease no longer exists".into(),
+            ));
+        };
+        let current = super::recovery::decode_lease(&row)?;
+        if current.owner_id != self.owner.owner_id
+            || current.generation != self.owner.generation
+            || current.expires_at <= now
+        {
+            return Err(StorageError::Invalid(
+                "expired or superseded execution lease cannot be renewed".into(),
+            ));
+        }
+        let updated = sqlx::query("UPDATE execution_leases SET heartbeat_at = ?, expires_at = ? WHERE execution_id = ? AND owner_id = ? AND generation = ? AND expires_at = ?")
+            .bind(timestamp(now)).bind(timestamp(expires_at)).bind(id.to_string()).bind(self.owner.owner_id.to_string()).bind(self.owner.generation).bind(timestamp(current.expires_at)).execute(&mut *tx).await?;
         if updated.rows_affected() != 1 {
             return Err(StorageError::Invalid(
-                "execution lease is not owned by this storage instance".into(),
+                "execution lease is not owned by this storage instance and generation".into(),
             ));
         }
         tx.commit().await?;
         self.lease(id)
             .await?
             .ok_or_else(|| StorageError::Invalid("renewed lease disappeared".into()))
+    }
+}
+
+async fn validate_owner_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: Uuid,
+    owner: &OwnerIdentity,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), StorageError> {
+    let row = sqlx::query(
+        "SELECT owner_id, generation, expires_at FROM execution_leases WHERE execution_id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(StorageError::Invalid(
+            "execution has no active owner lease".into(),
+        ));
+    };
+    let owner_id: String = row.try_get("owner_id")?;
+    let generation: i64 = row.try_get("generation")?;
+    let expires_at = parse_timestamp(row.try_get("expires_at")?)?;
+    if owner_id != owner.owner_id.to_string() || generation != owner.generation || expires_at <= now
+    {
+        return Err(StorageError::Invalid(
+            "execution lease is expired or belongs to another owner generation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_originating_process(owner: &OwnerIdentity) -> Result<(), StorageError> {
+    if owner.is_current_process() {
+        Ok(())
+    } else {
+        Err(StorageError::Invalid(
+            "execution lease can only be used by its originating process".into(),
+        ))
+    }
+}
+
+fn validate_verification_contract(
+    checks: &[crate::core::VerificationCommand],
+) -> Result<(), StorageError> {
+    let mut names = std::collections::HashSet::with_capacity(checks.len());
+    for check in checks {
+        if check.name.trim().is_empty()
+            || check.argv.is_empty()
+            || check.argv.iter().any(|part| part.is_empty())
+            || !names.insert(check.name.as_str())
+        {
+            return Err(StorageError::Invalid(
+                "verification checks require unique non-empty names and argv".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl SqliteExecutionRepository {
+    #[allow(dead_code)] // Called by the trusted verification path; no execution coordinator exists yet.
+    pub(crate) async fn verification_contract(
+        &self,
+        id: Uuid,
+    ) -> Result<PersistedVerificationContract, StorageError> {
+        let row = sqlx::query(
+            "SELECT version, checks_json FROM verification_contracts WHERE execution_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            entity: "verification contract",
+            id: id.to_string(),
+        })?;
+        let version: String = row.try_get("version")?;
+        let checks: String = row.try_get("checks_json")?;
+        Ok(PersistedVerificationContract {
+            version: Uuid::parse_str(&version).map_err(|error| {
+                StorageError::Invalid(format!("invalid verification contract version: {error}"))
+            })?,
+            required_checks: serde_json::from_str(&checks)?,
+        })
+    }
+
+    #[allow(dead_code)] // Intentionally inaccessible to external callers and agent adapters.
+    /// Persists only an opaque result created by the trusted verifier.
+    ///
+    /// ```compile_fail
+    /// # async fn example(repo: &synroute::storage::SqliteExecutionRepository, id: uuid::Uuid, report: synroute::verification::VerificationReport) {
+    /// repo.record_verification(id, report).await.unwrap();
+    /// # }
+    /// ```
+    pub(crate) async fn record_verification(
+        &self,
+        id: Uuid,
+        verified: crate::verification::ExecutedVerification,
+    ) -> Result<(), StorageError> {
+        ensure_originating_process(&self.owner)?;
+        let report = verified.report();
+        let contract_version = verified.contract_version();
+        validate_verification_report(report)?;
+        let report_json = serde_json::to_value(report)?;
+        check_sensitive_keys(&report_json)?;
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+        let locked = sqlx::query("UPDATE executions SET updated_at = ? WHERE id = ?")
+            .bind(timestamp(now))
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if locked.rows_affected() == 0 {
+            return Err(StorageError::NotFound {
+                entity: "execution",
+                id: id.to_string(),
+            });
+        }
+        validate_owner_tx(&mut tx, id, &self.owner, now).await?;
+        let state: String = sqlx::query_scalar("SELECT state FROM executions WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        if state_from_db(&state)? != crate::core::ExecutionState::Verifying {
+            return Err(StorageError::Invalid(
+                "verification evidence can only be recorded while execution is verifying".into(),
+            ));
+        }
+        let contract_row = sqlx::query(
+            "SELECT version, checks_json FROM verification_contracts WHERE execution_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            entity: "verification contract",
+            id: id.to_string(),
+        })?;
+        let persisted_version: String = contract_row.try_get("version")?;
+        if persisted_version != contract_version.to_string() {
+            return Err(StorageError::Invalid(
+                "verification result is bound to a stale contract version".into(),
+            ));
+        }
+        let required: Vec<crate::core::VerificationCommand> =
+            serde_json::from_str(&contract_row.try_get::<String, _>("checks_json")?)?;
+        validate_report_matches_contract(report, &required)?;
+        sqlx::query("INSERT INTO verification_evidence (execution_id, report_json, occurred_at, status, contract_version) VALUES (?, ?, ?, ?, ?)")
+            .bind(id.to_string()).bind(serde_json::to_string(&report_json)?).bind(timestamp(now)).bind(verification_status_str(report.status)).bind(contract_version.to_string()).execute(&mut *tx).await?;
+        append_event_tx(
+            &mut tx,
+            id,
+            ExecutionEventType::VerificationCompleted,
+            json!({"status": report.status, "contract_version": contract_version}),
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -394,23 +566,50 @@ fn lease_expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>, Stor
         .ok_or_else(|| StorageError::Invalid("execution lease expiry overflows timestamp".into()))
 }
 
+#[allow(dead_code)]
 fn validate_verification_report(
     report: &crate::verification::VerificationReport,
 ) -> Result<(), StorageError> {
     let all_checks_passed = !report.checks.is_empty()
-        && report
-            .checks
-            .iter()
-            .all(|check| check.status == crate::verification::CheckStatus::Passed);
+        && report.session_cleanup.is_successful()
+        && report.checks.iter().all(|check| {
+            check.status == crate::verification::CheckStatus::Passed
+                && check.termination == crate::sandbox::Termination::Exited
+                && check.exit_code == Some(0)
+                && check.cleanup.is_successful()
+        });
     if (report.status == crate::verification::VerificationStatus::Passed) != all_checks_passed {
         return Err(StorageError::Invalid(
-            "verification status must be passed exactly when a non-empty set of checks all passed"
+            "verification status must be passed exactly when all checks and session cleanup succeeded"
                 .into(),
         ));
     }
     Ok(())
 }
 
+#[allow(dead_code)]
+fn validate_report_matches_contract(
+    report: &crate::verification::VerificationReport,
+    required: &[crate::core::VerificationCommand],
+) -> Result<(), StorageError> {
+    if report.checks.len() != required.len()
+        || required.iter().any(|expected| {
+            report
+                .checks
+                .iter()
+                .filter(|actual| actual.name == expected.name && actual.argv == expected.argv)
+                .count()
+                != 1
+        })
+    {
+        return Err(StorageError::Invalid(
+            "verification results do not exactly match all required contract checks".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn verification_status_str(status: crate::verification::VerificationStatus) -> &'static str {
     match status {
         crate::verification::VerificationStatus::Passed => "passed",

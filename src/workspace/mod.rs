@@ -1,10 +1,9 @@
+use crate::git;
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Stdio,
 };
-use tokio::process::Command;
 use uuid::Uuid;
 
 /// Tracks worktrees created by this manager. The registry is intentionally process-local;
@@ -56,16 +55,16 @@ impl WorkspaceManager {
         if tokio::fs::try_exists(&target).await? {
             bail!("workspace path '{}' already exists", target.display());
         }
-        let output = Command::new("git")
-            .args(["worktree", "add", "--detach"])
-            .arg(&target)
-            .arg(revision)
-            .current_dir(&repository)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("could not start Git worktree add")?;
+        let target_text = target
+            .to_str()
+            .context("workspace path is not UTF-8; refusing Git invocation")?;
+        let output = git::output(
+            &repository,
+            &["worktree", "add", "--detach", target_text, revision],
+            true,
+        )
+        .await
+        .context("could not start isolated Git worktree add")?;
         if !output.status.success() {
             bail!(
                 "git worktree add failed: {}",
@@ -108,12 +107,13 @@ impl WorkspaceManager {
                 owned_path.display()
             );
         }
-        let status = Command::new("git")
-            .args(["status", "--porcelain", "--untracked-files=all"])
-            .current_dir(&owned_path)
-            .output()
-            .await
-            .context("check worktree changes")?;
+        let status = git::output(
+            &owned_path,
+            &["status", "--porcelain", "--untracked-files=all"],
+            true,
+        )
+        .await
+        .context("check worktree changes using isolated Git")?;
         if !status.status.success() {
             bail!(
                 "could not inspect workspace changes: {}",
@@ -126,15 +126,12 @@ impl WorkspaceManager {
                 owned_path.display()
             );
         }
-        let output = Command::new("git")
-            .args(["worktree", "remove"])
-            .arg(&owned_path)
-            .current_dir(&repository)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+        let path_text = owned_path
+            .to_str()
+            .context("workspace path is not UTF-8; refusing Git invocation")?;
+        let output = git::output(&repository, &["worktree", "remove", path_text], true)
             .await
-            .context("could not start Git worktree remove")?;
+            .context("could not start isolated Git worktree remove")?;
         if !output.status.success() {
             bail!(
                 "git worktree remove failed: {}",
@@ -147,12 +144,9 @@ impl WorkspaceManager {
 }
 
 async fn is_registered(repository: &Path, workspace: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repository)
-        .output()
+    let output = git::output(repository, &["worktree", "list", "--porcelain"], true)
         .await
-        .context("list Git worktrees")?;
+        .context("list Git worktrees using isolated Git")?;
     if !output.status.success() {
         bail!(
             "git worktree list failed: {}",
@@ -292,7 +286,7 @@ mod tests {
         let path = create(&mut manager, repo.path(), base.path(), id).await;
         assert!(
             StdCommand::new("git")
-                .args(["worktree", "remove", "--force"])
+                .args(["worktree", "remove"])
                 .arg(&path)
                 .current_dir(repo.path())
                 .status()
@@ -307,6 +301,117 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not registered")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn worktree_commands_disable_hooks_fsmonitor_and_filters() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = repo();
+        let base = tempfile::tempdir().unwrap();
+        let marker = base.path().join("host-helper-ran");
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "filtered.txt filter=evil\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("filtered.txt"), "fixture\n").unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["add", "."])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args(["commit", "-q", "-m", "filters"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let helper = base.path().join("helper.sh");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf invoked >> '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        let helper_text = helper.to_str().unwrap();
+        for (key, value) in [
+            ("core.fsmonitor", helper_text),
+            ("filter.evil.smudge", helper_text),
+            ("filter.evil.clean", helper_text),
+            ("filter.evil.process", helper_text),
+        ] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let hook = repo.path().join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf invoked >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+        let configured_hooks = base.path().join("configured-hooks");
+        std::fs::create_dir(&configured_hooks).unwrap();
+        let configured_hook = configured_hooks.join("post-checkout");
+        std::fs::write(
+            &configured_hook,
+            format!("#!/bin/sh\nprintf invoked >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&configured_hook).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&configured_hook, permissions).unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "config",
+                    "core.hooksPath",
+                    configured_hooks.to_str().unwrap()
+                ])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let revision = String::from_utf8(
+            StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        let mut manager = WorkspaceManager::new();
+        let path = manager
+            .create(repo.path(), base.path(), id, revision.trim())
+            .await
+            .unwrap();
+        manager.remove(id, &path).await.unwrap();
+        assert!(
+            !marker.exists(),
+            "repository-controlled Git helper ran on host"
         );
     }
 }
