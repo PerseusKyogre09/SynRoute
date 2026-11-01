@@ -1,17 +1,13 @@
-# Initial architecture
+# Architecture
 
-Synroute is a modular monolith. `core` owns serializable task contracts and validates lifecycle edges; `repository` discovers a canonical Git root, pinned revision, manifest hints, and the caller's working subdirectory; `workspace` creates Git worktrees and tracks ownership for the current process; `agent` is the provider boundary; `verification` represents deterministic check evidence; `execution` currently re-exports lifecycle contracts; `memory` is not implemented.
+Synroute is a modular monolith. `core` owns task contracts and lifecycle transitions; `repository` discovers a canonical Git root and project hints; `workspace` creates detached worktrees and tracks current-process ownership; `sandbox` defines provider-independent execution types, authorization policy, and a Docker CLI provider; `verification` authorizes and runs explicit argv checks only through a configured sandbox. `agent` remains an adapter boundary. `execution` currently re-exports lifecycle contracts; persistence, orchestration, Repo Memory, Codex integration, and API execution endpoints are not implemented.
 
-## Current phase boundary
+## Phase 2 execution boundary
 
-Repository discovery and worktree lifecycle helpers are implemented. Discovery treats manifest-derived commands as informational and never runs them. Worktree removal requires an ID and path registered by the current `WorkspaceManager`, confirms that Git still registers it, refuses modified or untracked content, and uses non-forced Git removal. The ownership registry is in-memory: after process restart, the manager refuses cleanup because it cannot establish ownership. Git worktrees provide source-control isolation only, not execution security.
+Verification fails closed when an allowed command has no sandbox provider/configuration. Denied, unsupported, and approval-required commands are not executed. Empty contracts are incomplete. Docker uses non-root execution, no network, dropped capabilities, no-new-privileges, read-only root, explicit workspace and temporary mounts, CPU/memory/PID limits, bounded stdout/stderr, timeouts, cooperative cancellation, and label-checked cleanup. See [security.md](security.md) for assumptions and operational limits.
 
-Execution orchestration, Codex App Server, independent sandboxed verification, SQLite persistence, recovery, and repository-specific learning are not implemented. The verification helper remains an unsandboxed process runner and must not be used for untrusted repository commands.
+The Docker provider is not a complete host security guarantee. It trusts the local CLI/daemon and host kernel. Git worktrees are not sandboxes. The unsandboxed verification helper has been removed from the public path and cannot execute repository commands directly.
 
-## Decisions
+## Persistence and ownership
 
-- Initial DB schema is SQLite, but there is no storage implementation yet.
-- Repository identity is pinned to the current full Git commit ID; a nested input path is retained separately.
-- Project manifests are checked at repository root. Command hints are not executed.
-- Lifecycle transitions are centrally validated. `Completed` means independent verification succeeded; agent-reported completion is a separate observation. Partial, unverified, failure, cancellation, interruption, and timeout are explicit terminal classifications.
-- Worktrees are detached and tracked by a process-local manager. Cleanup never forces removal and refuses unknown ownership or dirty state.
+SQLite schema exists, but storage integration does not. Workspace ownership remains process-local: after restart cleanup is refused. Durable ownership metadata is deferred rather than inferred from a Git worktree alone.
