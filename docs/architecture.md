@@ -1,6 +1,8 @@
 # Architecture
 
-Synroute is a modular monolith. `core` owns task contracts and lifecycle transitions; `repository` discovers a canonical Git root and project hints; `workspace` creates detached worktrees and tracks both current-process and durable ownership; `sandbox` defines provider-independent execution types, authorization policy, and a Docker CLI provider; `verification` authorizes and runs explicit argv checks only through a configured sandbox; `storage` owns SQLite migrations and async repositories; `recovery` performs conservative restart inspection. `agent` remains an adapter boundary. The execution coordinator, Codex integration, Repo Memory, and API execution endpoints are not implemented.
+Synroute is a modular monolith. `core` owns task contracts and lifecycle transitions; `repository` discovers a canonical Git root and project hints; `workspace` creates detached worktrees and tracks durable ownership; `sandbox` defines execution types, authorization, and a Docker CLI provider; `verification` runs explicit argv checks only through a configured sandbox; `storage` owns SQLite and repositories; `recovery` performs conservative restart inspection. `execution::coordinator` now persists intent, loads `synroute-verification.json`, creates an owned worktree, and uses the existing lifecycle and event store. The provider-independent `CodingAgent` contract describes events, capabilities, cancellation, output limits, timeout and metadata. It refuses invocation unless an adapter proves isolated execution.
+
+The first adapter identifier is `codex-app-server`, but it is intentionally unsupported. The local Codex App Server exposes experimental stdio JSON-RPC and can execute tools/subprocesses. Synroute's Docker API currently supports bounded one-shot command execution, not a long-lived interactive App Server protocol process. Launching the installed Codex process on the host would permit repository-modifying operations outside Docker. The adapter therefore fails closed. `synroute run` is a coordinator diagnostic entry point, not an end-to-end coding-task feature; it records a failed execution and retains the worktree for inspection when Codex is selected.
 
 ## Phase 2 execution boundary
 
@@ -9,6 +11,20 @@ Verification fails closed when an allowed command has no sandbox provider/config
 The Docker provider is not a complete host security guarantee. It trusts the local CLI/daemon and host kernel. Git worktrees are not sandboxes. The unsandboxed verification helper has been removed from the public path and cannot execute repository commands directly. Docker execution requires configured SQLite storage. Synroute persists a unique execution-scoped container name and random ownership token before create, then persists a returned ID before start. Unresolved intents and safe cleanup diagnostics remain visible in reports and startup inspection; recovery never performs Docker cleanup.
 
 Docker create and attached start share one monotonic operation deadline and caller cancellation signal. Cleanup receives a separate 15-second grace deadline; session destruction shares one grace deadline across tracked containers. `ExecutionResult` keeps command termination, exit status, bounded output/truncation and execution error separate from cleanup outcome. Verification preserves this evidence and cannot pass when command or session cleanup is unconfirmed. Cleanup resolves a candidate by generated name only, then removes by ID after checking the exact name, managed label, execution ID, and random token label. Durable identity does not prove a container still exists and does not authorize cleanup after restart.
+
+## Coordinator and agent integration
+
+The coordinator uses the existing SQLite execution intent/lease, lifecycle transitions, `PersistentWorkspaceManager`, and trusted `verification::run_for_execution` insertion boundary. It refuses an absent or structurally invalid verification contract. Agent events are append-only `AgentActivity` records. An agent's own completion cannot establish `Completed`. At present the coordinator does not execute the agent or complete verification: Codex is explicitly unsupported because the required long-lived protocol process and its tool subprocess tree are not yet proven to run entirely inside the Docker workload. It retains changed worktrees; normal clean-only workspace removal remains the only automatic removal path.
+
+CLI form: `synroute run <repository> --task "..." [--timeout SECONDS] [--agent codex-app-server] [--json] [--database sqlite://...]`. This command is not a working end-to-end agent integration yet.
+
+## Repository profiler
+
+`repository::profiler` is separate from execution coordination and emits schema-versioned `synroute-profile.json`. It enumerates Git-visible files using `git ls-files --cached --others --exclude-standard`, so standard `.gitignore` rules apply without running repository commands. It omits common generated/dependency directories, binary extensions, common secret filenames, files over 256 KiB, and scans over 32 MiB; profiles at most 1,500 file entries. Classifications are deterministic heuristics with evidence and heuristic confidence, not learned scores. Recommendations are broad model task categories only.
+
+Without provider configuration all analysis is local and deterministic. An optional OpenAI-compatible chat-completions HTTP endpoint can add a short summary. Loopback HTTP endpoints (llama.cpp/LM Studio) are supported directly. A non-loopback HTTP endpoint is rejected unless `--allow-remote` explicitly consents to sending repository paths and structural metadata. API credentials are read from `SYNROUTE_PROFILE_API_KEY` and never serialized or logged. HTTPS is not implemented in this dependency-free transport and is rejected.
+
+CLI: `synroute profile <repository> [--output PATH] [--provider http://127.0.0.1:1234/v1/chat/completions --model MODEL] [--allow-remote] [--json]`. The generated profile can be consumed by future Codex/model-selector integrations; this milestone does not implement routing or benchmarking.
 
 ## Persistence, ownership, and recovery
 

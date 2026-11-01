@@ -1,0 +1,368 @@
+{
+  "schema_version": "1.0",
+  "repository": {
+    "name": "RustBoy",
+    "root": "/home/perseuskyogre/Projects/RustBoy",
+    "revision": "9f8fca3c83e48c94e58fae6131e03fe35dfa0374"
+  },
+  "project": {
+    "project_type": "Rust application or library",
+    "summary": "Rust application or library project with 21 profiled files across 3 detected language categories.",
+    "confidence": 0.78,
+    "evidence": [
+      "Cargo.toml"
+    ]
+  },
+  "languages": [
+    {
+      "name": "Rust",
+      "files": 17
+    },
+    {
+      "name": "Configuration",
+      "files": 1
+    },
+    {
+      "name": "Documentation",
+      "files": 1
+    }
+  ],
+  "manifests": [
+    "Cargo.toml"
+  ],
+  "tests": [
+    "tests/apu.rs",
+    "tests/cpu.rs",
+    "tests/hardware.rs",
+    "tests/ppu.rs"
+  ],
+  "directories": [
+    {
+      "path": "src",
+      "responsibility": "application or library source",
+      "task_types": [
+        "coding",
+        "debugging"
+      ],
+      "confidence": 0.88,
+      "evidence": [
+        "directory name identifies source code"
+      ]
+    },
+    {
+      "path": "src/bus",
+      "responsibility": "application or library source",
+      "task_types": [
+        "coding",
+        "debugging"
+      ],
+      "confidence": 0.88,
+      "evidence": [
+        "directory name identifies source code"
+      ]
+    },
+    {
+      "path": "src/cpu",
+      "responsibility": "application or library source",
+      "task_types": [
+        "coding",
+        "debugging"
+      ],
+      "confidence": 0.88,
+      "evidence": [
+        "directory name identifies source code"
+      ]
+    },
+    {
+      "path": "tests",
+      "responsibility": "tests and fixtures",
+      "task_types": [
+        "testing"
+      ],
+      "confidence": 0.93,
+      "evidence": [
+        "directory name matches test convention"
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": ".gitignore",
+      "language": "unknown",
+      "task_types": [
+        "text_reasoning"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "text or configuration file"
+      ]
+    },
+    {
+      "path": "Cargo.lock",
+      "language": "unknown",
+      "task_types": [
+        "text_reasoning"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "text or configuration file"
+      ]
+    },
+    {
+      "path": "Cargo.toml",
+      "language": "Configuration",
+      "task_types": [
+        "text_reasoning"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "text or configuration file"
+      ]
+    },
+    {
+      "path": "README.md",
+      "language": "Documentation",
+      "task_types": [
+        "documentation",
+        "text_reasoning"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "documentation path or file type"
+      ]
+    },
+    {
+      "path": "src/apu.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/bus/bus.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/bus/mod.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/cartridge.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/cpu/cpu.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/cpu/instruction.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/cpu/mod.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/cpu/opcodes.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/cpu/registers.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/gameboy.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/hardware.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/lib.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "src/ppu.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust"
+      ]
+    },
+    {
+      "path": "tests/apu.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding",
+        "testing"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust",
+        "path matches test naming convention"
+      ]
+    },
+    {
+      "path": "tests/cpu.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding",
+        "testing"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust",
+        "path matches test naming convention"
+      ]
+    },
+    {
+      "path": "tests/hardware.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding",
+        "testing"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust",
+        "path matches test naming convention"
+      ]
+    },
+    {
+      "path": "tests/ppu.rs",
+      "language": "Rust",
+      "task_types": [
+        "coding",
+        "testing"
+      ],
+      "confidence": 0.72,
+      "evidence": [
+        "file extension maps to Rust",
+        "path matches test naming convention"
+      ]
+    }
+  ],
+  "model_categories": [
+    {
+      "category": "code_reasoning",
+      "task_types": [
+        "coding",
+        "debugging"
+      ],
+      "evidence": [
+        "Detected source files"
+      ]
+    },
+    {
+      "category": "test_analysis",
+      "task_types": [
+        "testing"
+      ],
+      "evidence": [
+        "Detected test paths"
+      ]
+    },
+    {
+      "category": "long_context_reasoning",
+      "task_types": [
+        "documentation",
+        "text_reasoning"
+      ],
+      "evidence": [
+        "Repository-wide documentation and source structure"
+      ]
+    }
+  ],
+  "profiling": {
+    "method": "deterministic",
+    "llm_provider": null,
+    "files_considered": 23,
+    "files_excluded": 2,
+    "truncated": false
+  }
+}

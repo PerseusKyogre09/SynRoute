@@ -27,6 +27,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Profile a repository into a compact reusable JSON document.
+    Profile {
+        repository: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// OpenAI-compatible chat-completions URL (local by default; remote requires --allow-remote).
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Explicitly consent to sending repository structure and paths to a remote provider.
+        #[arg(long)]
+        allow_remote: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a coding task (currently fails closed when no safe agent adapter is available).
+    Run {
+        repository: PathBuf,
+        #[arg(long)]
+        task: String,
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+        #[arg(long, default_value = "codex-app-server")]
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect repository identity and available verification hints.
     Inspect { repository: PathBuf },
     /// Run the fixed, explicitly authorized pytest contract in a Docker sandbox.
@@ -59,6 +87,53 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let command = match cli.command {
+        Command::Profile {
+            repository,
+            output,
+            provider,
+            model,
+            allow_remote,
+            json,
+        } => {
+            let profile = synroute::repository::profiler::profile(
+                &repository,
+                &synroute::repository::profiler::ProfileOptions {
+                    provider,
+                    model,
+                    allow_remote,
+                },
+            )
+            .await?;
+            let output =
+                output.unwrap_or_else(|| profile.repository.root.join("synroute-profile.json"));
+            let serialized = serde_json::to_string_pretty(&profile)?;
+            tokio::fs::write(&output, format!("{serialized}\n")).await?;
+            if json {
+                println!("{serialized}");
+            } else {
+                println!(
+                    "Profile written: {}\nProject type: {}\nLanguages: {}\nFiles profiled: {}",
+                    output.display(),
+                    profile.project.project_type,
+                    profile
+                        .languages
+                        .iter()
+                        .map(|l| l.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    profile.files.len()
+                );
+            }
+            return Ok(());
+        }
+        Command::Inspect { repository } => {
+            let profile = synroute::repository::discover(&repository).await?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+            return Ok(());
+        }
+        command => command,
+    };
     let storage = SqliteStorage::from_url(&cli.database).await?;
     let recovery_service = RecoveryService::new(storage.clone());
     let mut recovery = recovery_service
@@ -68,7 +143,87 @@ async fn main() -> Result<()> {
     if recovery.requires_attention() {
         tracing::warn!(recovery_report = ?recovery, "unfinished executions require manual recovery");
     }
-    match cli.command {
+    match command {
+        Command::Profile {
+            repository,
+            output,
+            provider,
+            model,
+            allow_remote,
+            json,
+        } => {
+            let profile = synroute::repository::profiler::profile(
+                &repository,
+                &synroute::repository::profiler::ProfileOptions {
+                    provider,
+                    model,
+                    allow_remote,
+                },
+            )
+            .await?;
+            let root = profile.repository.root.clone();
+            let output = output.unwrap_or_else(|| root.join("synroute-profile.json"));
+            let serialized = serde_json::to_string_pretty(&profile)?;
+            tokio::fs::write(&output, format!("{serialized}\n")).await?;
+            if json {
+                println!("{serialized}");
+            } else {
+                println!(
+                    "Profile written: {}\nProject type: {}\nLanguages: {}\nFiles profiled: {}",
+                    output.display(),
+                    profile.project.project_type,
+                    profile
+                        .languages
+                        .iter()
+                        .map(|l| l.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    profile.files.len()
+                );
+            }
+        }
+        Command::Run {
+            repository,
+            task,
+            timeout,
+            agent,
+            json,
+        } => {
+            anyhow::ensure!(
+                agent == "codex-app-server",
+                "unsupported agent selection '{agent}'"
+            );
+            let result = synroute::execution::coordinator::run(
+                storage,
+                &repository,
+                &task,
+                std::time::Duration::from_secs(timeout),
+                &synroute::agent::CodexAppServer,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Execution: {}\nState: {:?}\nProvider: {}\nWorkspace: {}\nFailure: {}",
+                    result.execution_id,
+                    result.state,
+                    result.provider,
+                    result
+                        .workspace
+                        .as_ref()
+                        .map_or_else(|| "none".into(), |p| p.display().to_string()),
+                    result.primary_error.as_deref().unwrap_or("none")
+                );
+                if let Some(error) = result.cleanup_error {
+                    println!("Cleanup diagnostics: {error}");
+                }
+            }
+            anyhow::ensure!(
+                result.state == synroute::core::ExecutionState::Completed,
+                "task did not complete; agent execution and independent verification are unavailable"
+            )
+        }
         Command::Inspect { repository } => {
             let profile = synroute::repository::discover(&repository).await?;
             println!("{}", serde_json::to_string_pretty(&profile)?);

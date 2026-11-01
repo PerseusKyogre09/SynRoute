@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod profiler;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryProfile {
     /// Canonical Git repository root.

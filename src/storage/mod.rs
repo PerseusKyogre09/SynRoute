@@ -247,6 +247,7 @@ pub enum ExecutionEventType {
     WorkspaceRemoved,
     AgentExecutionStarted,
     AgentExecutionCompleted,
+    AgentActivity,
     VerificationStarted,
     VerificationCompleted,
     RecoveryAttempted,
@@ -273,6 +274,7 @@ impl ExecutionEventType {
                 | Self::WorkspacePrepared
                 | Self::WorkspaceRemoved
                 | Self::WorkspaceOwnershipUncertain
+                | Self::AgentActivity
         )
     }
 
@@ -286,6 +288,7 @@ impl ExecutionEventType {
             Self::AgentExecutionStarted => "agent_execution_started",
             Self::WorkspaceRemoved => "workspace_removed",
             Self::AgentExecutionCompleted => "agent_execution_completed",
+            Self::AgentActivity => "agent_activity",
             Self::VerificationStarted => "verification_started",
             Self::VerificationCompleted => "verification_completed",
             Self::RecoveryAttempted => "recovery_attempted",
