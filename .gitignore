@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Local application state
+/synroute.db
+/synroute.db-*
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
