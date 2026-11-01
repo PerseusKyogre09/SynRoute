@@ -100,6 +100,8 @@ Responsible for:
 
 **A Git worktree is source-control isolation, not a security sandbox.**
 
+Persistent workspace cleanup requires agreement between the SQLite owner record, the local ownership sidecar, and Git worktree registration. Uncertain or inconsistent ownership means cleanup is refused; never force-remove a worktree.
+
 ### Execution Engine
 
 Responsible for:
@@ -108,6 +110,12 @@ Responsible for:
 - Handling streamed agent events.
 - Enforcing timeouts and execution budgets.
 - Persisting execution state.
+
+Execution records and append-only event history are stored through `storage`; do not add SQL queries to domain or orchestration modules. Execution intent must be committed before launching an external process. Lifecycle changes and their corresponding events must share one transaction. SQLite migrations are versioned and must preserve existing data.
+
+Execution creation must acquire a durable owner lease in the same transaction as execution intent. Lease owners must renew before expiry (default 45 seconds; maximum 300 seconds). On Linux, owner identity includes a random storage-instance UUID, PID, process start ticks, and boot ID; PID alone is never sufficient. Startup recovery must separate read-only inspection from mutation, and may transition to `RecoveryRequired` only when the lease has expired and the exact owner process identity is confirmed inactive. Unknown liveness must be reported in a durable recovery case without changing execution state or lease. Recovery must never resume executions or delete workspaces/containers. Open recovery cases remain visible until acknowledged or resolved and remain queryable as history afterward. There is no heartbeat worker or execution coordinator yet; future execution code must renew leases explicitly.
+
+`Completed` is reserved for a non-empty latest verification report whose overall status and every check status are passing. Enforce this in the SQLite repository transaction and in database triggers; keep verification evidence insertion and its event atomic. Never trust provider-reported agent completion as verification evidence.
 
 ### Verification Engine
 

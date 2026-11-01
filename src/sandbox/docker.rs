@@ -1,6 +1,6 @@
 use super::{
-    ExecutionResult, ResourceLimits, SandboxCommand, SandboxConfig, SandboxError, SandboxProvider,
-    SandboxSession, Termination,
+    ExecutionResult, ResourceLimits, RuntimeContainerPresence, RuntimeInspector, SandboxCommand,
+    SandboxConfig, SandboxError, SandboxProvider, SandboxSession, Termination,
 };
 use async_trait::async_trait;
 use std::{
@@ -47,6 +47,53 @@ impl SandboxProvider for DockerSandbox {
             workspace,
             containers: Vec::new(),
         }))
+    }
+}
+
+#[async_trait]
+impl RuntimeInspector for DockerSandbox {
+    async fn inspect_execution(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<Vec<RuntimeContainerPresence>, SandboxError> {
+        let args = vec![
+            "ps".into(),
+            "--all".into(),
+            "--filter".into(),
+            format!("label={MANAGED}=true"),
+            "--filter".into(),
+            format!("label={EXECUTION}={execution_id}"),
+            "--format".into(),
+            "{{.ID}}|{{.Names}}|{{.State}}".into(),
+        ];
+        let output = run_capture(&self.binary, &args, Duration::from_secs(10)).await?;
+        if output.exit_code != Some(0) {
+            return Err(SandboxError::Provider(format!(
+                "Docker runtime inspection failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let mut containers = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut columns = line.split('|');
+            let (Some(id), Some(name), Some(state)) =
+                (columns.next(), columns.next(), columns.next())
+            else {
+                continue;
+            };
+            if !valid_id(id) {
+                continue;
+            }
+            let ownership_labels_verified =
+                verify_container_labels(&self.binary, id, execution_id).await?;
+            containers.push(RuntimeContainerPresence {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                state: state.to_owned(),
+                ownership_labels_verified,
+            });
+        }
+        Ok(containers)
     }
 }
 
@@ -281,19 +328,26 @@ impl DockerSession {
         if !valid_container_reference(id, self.config.execution_id) {
             return Ok(false);
         }
-        let format = format!(
-            "{{{{ index .Config.Labels \"{MANAGED}\" }}}}|{{{{ index .Config.Labels \"{EXECUTION}\" }}}}"
-        );
-        let output = run_capture(
-            &self.docker,
-            &["inspect".into(), "--format".into(), format, id.into()],
-            Duration::from_secs(10),
-        )
-        .await?;
-        Ok(output.exit_code == Some(0)
-            && String::from_utf8_lossy(&output.stdout).trim()
-                == format!("true|{}", self.config.execution_id))
+        verify_container_labels(&self.docker, id, self.config.execution_id).await
     }
+}
+
+async fn verify_container_labels(
+    docker: &Path,
+    id: &str,
+    execution_id: Uuid,
+) -> Result<bool, SandboxError> {
+    let format = format!(
+        "{{{{ index .Config.Labels \"{MANAGED}\" }}}}|{{{{ index .Config.Labels \"{EXECUTION}\" }}}}"
+    );
+    let output = run_capture(
+        docker,
+        &["inspect".into(), "--format".into(), format, id.into()],
+        Duration::from_secs(10),
+    )
+    .await?;
+    Ok(output.exit_code == Some(0)
+        && String::from_utf8_lossy(&output.stdout).trim() == format!("true|{execution_id}"))
 }
 
 fn valid_id(value: &str) -> bool {

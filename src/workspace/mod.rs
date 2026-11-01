@@ -14,9 +14,22 @@ pub struct WorkspaceManager {
     owned: HashMap<Uuid, (PathBuf, PathBuf)>, // id -> (canonical repository, canonical workspace)
 }
 
+pub mod persistent;
+
 impl WorkspaceManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn adopt_owned(&mut self, id: Uuid, repository: PathBuf, workspace: PathBuf) -> Result<()> {
+        if let Some((known_repository, known_workspace)) = self.owned.get(&id) {
+            if known_repository != &repository || known_workspace != &workspace {
+                bail!("workspace ID {id} is already bound to different paths");
+            }
+            return Ok(());
+        }
+        self.owned.insert(id, (repository, workspace));
+        Ok(())
     }
 
     /// Creates a detached Git worktree. A Git worktree is source isolation, not a sandbox.

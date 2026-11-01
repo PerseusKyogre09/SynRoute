@@ -75,6 +75,15 @@ pub struct ExecutionResult {
     pub duration: Duration,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeContainerPresence {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    /// This validates Synroute labels only; it does not prove who created the container.
+    pub ownership_labels_verified: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum SandboxError {
     #[error("sandbox configuration is invalid: {0}")]
@@ -104,6 +113,14 @@ pub trait SandboxSession: Send {
         cancellation: watch::Receiver<bool>,
     ) -> Result<ExecutionResult, SandboxError>;
     async fn destroy(&mut self) -> Result<(), SandboxError>;
+}
+
+#[async_trait]
+pub trait RuntimeInspector: Send + Sync {
+    async fn inspect_execution(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<Vec<RuntimeContainerPresence>, SandboxError>;
 }
 
 pub mod authorization;

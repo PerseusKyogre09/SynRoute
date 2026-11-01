@@ -40,6 +40,8 @@ pub enum ExecutionState {
     Cancelled,
     Interrupted,
     TimedOut,
+    /// Execution ownership or liveness is uncertain after restart; manual review is required.
+    RecoveryRequired,
 }
 
 impl ExecutionState {
@@ -53,6 +55,7 @@ impl ExecutionState {
                 | Self::Cancelled
                 | Self::Interrupted
                 | Self::TimedOut
+                | Self::RecoveryRequired
         )
     }
 
@@ -82,7 +85,11 @@ impl ExecutionState {
         } || (from.is_some_and(|state| !state.is_terminal())
             && matches!(
                 to,
-                Self::Failed | Self::Cancelled | Self::Interrupted | Self::TimedOut
+                Self::Failed
+                    | Self::Cancelled
+                    | Self::Interrupted
+                    | Self::TimedOut
+                    | Self::RecoveryRequired
             ));
         if allowed {
             Ok(())
@@ -192,6 +199,7 @@ mod tests {
             ExecutionState::Cancelled,
             ExecutionState::Interrupted,
             ExecutionState::TimedOut,
+            ExecutionState::RecoveryRequired,
         ] {
             assert!(
                 ExecutionState::validate_transition(Some(ExecutionState::Executing), to).is_ok()
@@ -234,6 +242,7 @@ mod tests {
             ExecutionState::Cancelled,
             ExecutionState::Interrupted,
             ExecutionState::TimedOut,
+            ExecutionState::RecoveryRequired,
         ] {
             assert!(terminal.is_terminal());
             assert!(
