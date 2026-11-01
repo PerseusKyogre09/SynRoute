@@ -1,19 +1,17 @@
 # Initial architecture
 
-Synroute starts as a modular monolith. `core` owns serializable task and lifecycle contracts; `repository` discovers Git identity and project hints; `workspace` owns detached worktree lifecycle; `agent` is the provider boundary; `verification` runs deterministic checks and records raw output; `execution` will coordinate state transitions; `memory` will compute profiles only from persisted evidence. API and CLI are presentation surfaces over the same application services.
+Synroute is a modular monolith. `core` owns serializable task contracts and validates lifecycle edges; `repository` discovers a canonical Git root, pinned revision, manifest hints, and the caller's working subdirectory; `workspace` creates Git worktrees and tracks ownership for the current process; `agent` is the provider boundary; `verification` represents deterministic check evidence; `execution` currently re-exports lifecycle contracts; `memory` is not implemented.
 
-## First vertical slice
+## Current phase boundary
 
-The initial slice is repository inspection, pinned-revision worktree setup, Codex App Server execution, independent verification, and SQLite event/evidence persistence. A Git worktree provides isolation from the developer checkout but is not a security boundary. Untrusted repository commands must not run until a container or equivalent sandbox implementation exists with resource and network controls.
+Repository discovery and worktree lifecycle helpers are implemented. Discovery treats manifest-derived commands as informational and never runs them. Worktree removal requires an ID and path registered by the current `WorkspaceManager`, confirms that Git still registers it, refuses modified or untracked content, and uses non-forced Git removal. The ownership registry is in-memory: after process restart, the manager refuses cleanup because it cannot establish ownership. Git worktrees provide source-control isolation only, not execution security.
 
-## Dependencies
-
-Tokio/Axum for async runtime and future API; Serde for contracts; SQLx SQLite for local persistence; Clap for CLI; tracing for structured logs. Provider protocols stay behind `CodingAgent`. No model ranking or learning is enabled until real evidence exists.
+Execution orchestration, Codex App Server, independent sandboxed verification, SQLite persistence, recovery, and repository-specific learning are not implemented. The verification helper remains an unsandboxed process runner and must not be used for untrusted repository commands.
 
 ## Decisions
 
-- Initial DB: local SQLite, with migrations committed.
-- Initial repository pin: full Git commit hash.
-- Verification: explicit argv arrays, never shell strings; success requires every configured check to exit zero.
-- Worktrees: detached at the pinned commit, with cleanup explicit.
-- Security: worktree alone is not sandboxing; execution remains gated until sandbox support is implemented.
+- Initial DB schema is SQLite, but there is no storage implementation yet.
+- Repository identity is pinned to the current full Git commit ID; a nested input path is retained separately.
+- Project manifests are checked at repository root. Command hints are not executed.
+- Lifecycle transitions are centrally validated. `Completed` means independent verification succeeded; agent-reported completion is a separate observation. Partial, unverified, failure, cancellation, interruption, and timeout are explicit terminal classifications.
+- Worktrees are detached and tracked by a process-local manager. Cleanup never forces removal and refuses unknown ownership or dirty state.

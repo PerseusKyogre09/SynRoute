@@ -1,2 +1,4 @@
-//! Persistent state-machine orchestration is built on top of these transition contracts.
-pub use crate::core::{ExecutionState, StateTransition, TaskContract};
+//! Lifecycle contracts used by the future execution coordinator.
+pub use crate::core::{
+    AgentCompletion, ExecutionState, StateTransition, TaskContract, TransitionError,
+};
